@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Backpack 资金费率套利交易</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Microsoft YaHei', sans-serif; background: #f7f8fa; color: #333; padding: 16px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h2 { font-size: 18px; color: #444; margin-bottom: 12px; }
+  /* 状态栏 */
+  .status-bar { display: flex; gap: 20px; padding: 12px 16px; background: #fff; border-radius: 6px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .status-item { font-size: 13px; }
+  .status-item span { font-weight: 600; color: #e74c3c; }
+  .status-item .label { color: #999; margin-right: 6px; }
+  .dry-badge { padding: 2px 8px; background: #f0ad4e; color: #fff; border-radius: 3px; font-size: 11px; font-weight: 700; }
+  .live-badge { padding: 2px 8px; background: #5cb85c; color: #fff; border-radius: 3px; font-size: 11px; font-weight: 700; }
+  /* 主布局 */
+  .main { display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
+  /* 操作面板 */
+  .panel { background: #fff; border-radius: 6px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .panel label { display: block; font-size: 12px; color: #888; margin-top: 12px; margin-bottom: 4px; }
+  .panel select, .panel input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+  .panel select:focus, .panel input:focus { border-color: #3498db; outline: none; }
+  .btn-group { display: flex; gap: 8px; margin-top: 16px; }
+  .btn { flex: 1; padding: 10px 0; border: none; border-radius: 4px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .btn-open { background: #2ecc71; color: #fff; }
+  .btn-open:hover { background: #27ae60; }
+  .btn-close { background: #e74c3c; color: #fff; }
+  .btn-close:hover { background: #c0392b; }
+  .btn-cancel { background: #f39c12; color: #fff; }
+  .btn-cancel:hover { background: #e67e22; }
+  .btn-refresh { background: #3498db; color: #fff; }
+  .btn-refresh:hover { background: #2980b9; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .warn { margin-top: 8px; padding: 6px 10px; background: #fff3cd; border-radius: 4px; font-size: 12px; color: #856404; display: none; }
+  /* 数据面板 */
+  .data-panel { display: flex; flex-direction: column; gap: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #f0f0f0; padding: 8px; text-align: left; border-bottom: 2px solid #ddd; }
+  td { padding: 8px; border-bottom: 1px solid #eee; }
+  .pos-qty { font-weight: 600; }
+  /* 日志 */
+  .log-panel { max-height: 280px; overflow-y: auto; font-size: 12px; font-family: 'Consolas','Courier New',monospace; color: #555; background: #fafafa; border-radius: 4px; padding: 8px; }
+  .log-panel div { padding: 2px 0; border-bottom: 1px solid #f0f0f0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>Backpack 资金费率套利交易 | <span id="mode-badge">加载中</span></h2>
+
+  <div class="status-bar" id="status-bar">
+    <div class="status-item"><span class="label">余额 USDC</span><span id="bal-usdc">-</span></div>
+    <div class="status-item"><span class="label">持仓</span><span id="pos-count">-</span></div>
+    <div class="status-item"><span class="label">活跃订单</span><span id="ord-count">-</span></div>
+    <div class="status-item"><span class="label">保证金率</span><span id="margin-rate">-</span></div>
+  </div>
+
+  <div class="main">
+    <!-- 左侧操作面板 -->
+    <div class="panel">
+      <label>币种（抵押品 ∩ 合约）</label>
+      <select id="symbol-select"><option>加载中...</option></select>
+
+      <label>总名义金额 (USDC)</label>
+      <input type="number" id="notional" value="1000" min="100" step="100">
+
+      <label>杠杆倍数 (自动限制)</label>
+      <input type="number" id="leverage" value="2" min="1" max="10" step="0.5">
+      <div style="font-size:11px;color:#999;margin-top:2px;">最大允许: <span id="max-lev-info">-</span>x</div>
+
+      <label>单笔拆单 (USDC)</label>
+      <input type="number" id="order-size" value="100" min="50" step="50">
+
+      <label>超时秒数</label>
+      <input type="number" id="timeout" value="180" min="30" step="30">
+
+      <div class="btn-group">
+        <button class="btn btn-open" id="btn-open" onclick="doOpen()">开仓</button>
+        <button class="btn btn-close" id="btn-close" onclick="doClose()" disabled>平仓</button>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-cancel" onclick="doCancel()">撤单</button>
+        <button class="btn btn-refresh" onclick="refresh()">刷新</button>
+      </div>
+      <div class="warn" id="rate-warn">⚠ 周均年化 &lt; 10%，建议观望</div>
+    </div>
+
+    <!-- 右侧数据面板 -->
+    <div class="data-panel">
+      <!-- 持仓 -->
+      <div class="panel">
+        <h2>当前持仓</h2>
+        <table>
+          <thead><tr><th>币种</th><th>数量</th><th>名义(USDC)</th><th>入场价</th><th>开仓时间</th></tr></thead>
+          <tbody id="pos-tbody"><tr><td colspan="5" style="text-align:center;color:#999;">无持仓</td></tr></tbody>
+        </table>
+      </div>
+
+      <!-- 订单 -->
+      <div class="panel">
+        <h2>活跃订单</h2>
+        <table>
+          <thead><tr><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th></tr></thead>
+          <tbody id="ord-tbody"><tr><td colspan="5" style="text-align:center;color:#999;">无活跃订单</td></tr></tbody>
+        </table>
+      </div>
+
+      <!-- 日志 -->
+      <div class="panel">
+        <h2>操作日志</h2>
+        <div class="log-panel" id="log-container"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let symbols = [];
+const MODE = document.getElementById('mode-badge');
+const BTN_O = document.getElementById('btn-open');
+const BTN_C = document.getElementById('btn-close');
+const WARN = document.getElementById('rate-warn');
+
+async function api(url, data) {
+  try {
+    const opts = data ? { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data) } : {};
+    const r = await fetch(url, opts);
+    return await r.json();
+  } catch(e) { return {ok:false, error:e.message}; }
+}
+
+function fmt(num, d=2) { return typeof num==='number' ? num.toFixed(d) : (num||'-'); }
+
+async function loadSymbols() {
+  const data = await api('/api/symbols');
+  if (Array.isArray(data)) {
+    symbols = data.sort((a,b) => (b.latest_apy||0) - (a.latest_apy||0));
+    const sel = document.getElementById('symbol-select');
+    sel.innerHTML = '';
+    for (const s of symbols) {
+      const apy = s.latest_apy != null ? ` (${s.latest_apy}%APY)` : '';
+      sel.innerHTML += `<option value="${s.symbol}">${s.symbol}${apy} | 杠杆${s.max_leverage.toFixed(1)}x | 抵押${(s.haircut*100).toFixed(0)}%</option>`;
+    }
+    onSymbolChange();
+  }
+}
+
+function onSymbolChange() {
+  const sel = document.getElementById('symbol-select');
+  const sym = symbols.find(s => s.symbol === sel.value);
+  if (sym) {
+    document.getElementById('max-lev-info').textContent = sym.max_leverage.toFixed(1);
+    const lv = parseFloat(document.getElementById('leverage').value);
+    if (lv > sym.max_leverage) document.getElementById('leverage').value = Math.floor(sym.max_leverage);
+    document.getElementById('leverage').max = sym.max_leverage;
+  }
+}
+
+async function refresh() {
+  const state = await api('/api/state');
+  MODE.innerHTML = state.dry_run ? '<span class="dry-badge">DRY-RUN</span>' : '<span class="live-badge">LIVE</span>';
+  if (!state.has_key && !state.dry_run) MODE.innerHTML += ' <span style="color:#e74c3c;font-size:12px;">未配置KEY</span>';
+
+  // 余额
+  const balances = state.balances || [];
+  const usdc = balances.find(b => b.asset === 'USDC' || (b.symbol||'').includes('USDC'));
+  document.getElementById('bal-usdc').textContent = usdc ? fmt(usdc.available||usdc.free) : '-';
+
+  // 持仓
+  const positions = state.positions || {};
+  const posTbody = document.getElementById('pos-tbody');
+  const posEntries = Object.entries(positions);
+  document.getElementById('pos-count').textContent = posEntries.length;
+  BTN_C.disabled = posEntries.length === 0;
+
+  if (posEntries.length > 0) {
+    posTbody.innerHTML = posEntries.map(([sym, pos]) =>
+      `<tr><td>${sym}</td><td class="pos-qty">${fmt(pos.qty,4)}</td><td>${fmt(pos.notional,0)}</td><td>${fmt(pos.entry_price,2)}</td><td>${(pos.entry_time||'').slice(0,16)}</td></tr>`
+    ).join('');
+  } else {
+    posTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">无持仓</td></tr>';
+  }
+
+  // 订单
+  const orders = state.active_orders || {};
+  const ordTbody = document.getElementById('ord-tbody');
+  const ordEntries = Object.entries(orders);
+  document.getElementById('ord-count').textContent = ordEntries.length;
+
+  if (ordEntries.length > 0) {
+    let rows = '';
+    for (const [sym, ords] of ordEntries) {
+      for (const o of ords) {
+        rows += `<tr><td>${sym}</td><td>${o.side||'-'}</td><td>${fmt(o.qty,4)}</td><td>${fmt(o.price,4)}</td><td>${o.status||'-'}</td></tr>`;
+      }
+    }
+    ordTbody.innerHTML = rows;
+  } else {
+    ordTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">无活跃订单</td></tr>';
+  }
+
+  // 日志
+  const logs = state.logs || [];
+  document.getElementById('log-container').innerHTML = logs.map(l => `<div>${l}</div>`).join('');
+
+  // 保证金率
+  document.getElementById('margin-rate').textContent = '-';
+}
+
+async function doOpen() {
+  const sym = document.getElementById('symbol-select').value;
+  const notional = parseFloat(document.getElementById('notional').value);
+  const leverage = parseFloat(document.getElementById('leverage').value);
+  if (!sym || !notional || notional <= 0) return alert('请填写币种和金额');
+  BTN_O.disabled = true;
+  const r = await api('/api/open', { symbol: sym, notional, leverage });
+  BTN_O.disabled = false;
+  alert(r.ok ? `开仓完成 ${r.pairs_done}/${r.pairs_total} 对` : `开仓失败: ${r.error||r}`);
+  await refresh();
+}
+
+async function doClose() {
+  const sym = document.getElementById('symbol-select').value;
+  if (!sym) return;
+  BTN_C.disabled = true;
+  const r = await api('/api/close', { symbol: sym });
+  BTN_C.disabled = false;
+  alert(r.ok ? `平仓完成 ${r.pairs_done}/${r.pairs_total} 对` : `平仓失败: ${r.error||r}`);
+  await refresh();
+}
+
+async function doCancel() {
+  const sym = document.getElementById('symbol-select').value;
+  await api('/api/cancel', { symbol: sym });
+  await refresh();
+}
+
+document.getElementById('symbol-select').addEventListener('change', onSymbolChange);
+
+// 初始化
+loadSymbols().then(refresh);
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
