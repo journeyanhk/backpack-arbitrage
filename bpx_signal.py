@@ -74,11 +74,10 @@ def build_signals(pub: PublicStock, min_rate: float) -> List[dict]:
         if not rates:
             return None
 
-        # 最新费率取最近 3 期均值，避免单点异常值（恰逢该小时费率脉冲反转）
-        latest_3 = rates[-3:] if len(rates) >= 3 else rates[-1:]
-        latest_rate = sum(latest_3) / len(latest_3)
-        week = rates[-WEEK_HOURS:] if len(rates) >= WEEK_HOURS else rates
-        month = rates
+        # rates 按时间降序排列（最新在前），取 rates[0] 为最新一期
+        latest_rate = rates[0]
+        week = rates[:WEEK_HOURS] if len(rates) >= WEEK_HOURS else rates
+        month = rates[:MONTH_HOURS] if len(rates) >= MONTH_HOURS else rates
 
         imf_spot = float(col_item["imfFunction"]["base"])
         imf_perp = float(perp_item["imfFunction"]["base"])
