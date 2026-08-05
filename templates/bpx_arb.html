@@ -53,7 +53,7 @@
     <div class="status-item"><span class="label">余额 USDC</span><span id="bal-usdc">-</span></div>
     <div class="status-item"><span class="label">持仓</span><span id="pos-count">-</span></div>
     <div class="status-item"><span class="label">活跃订单</span><span id="ord-count">-</span></div>
-    <div class="status-item"><span class="label">保证金率</span><span id="margin-rate">-</span></div>
+    <div class="status-item"><span class="label">维持保证金率</span><span id="margin-rate">-</span></div>
   </div>
 
   <div class="main">
@@ -92,8 +92,8 @@
       <div class="panel">
         <h2>当前持仓</h2>
         <table>
-          <thead><tr><th>币种</th><th>数量</th><th>名义(USDC)</th><th>入场价</th><th>开仓时间</th></tr></thead>
-          <tbody id="pos-tbody"><tr><td colspan="5" style="text-align:center;color:#999;">无持仓</td></tr></tbody>
+          <thead><tr><th>币种</th><th>数量</th><th>名义(USDC)</th><th>入场价</th><th>盈亏(USDC)</th><th>费率(APY)</th><th>开仓时间</th></tr></thead>
+          <tbody id="pos-tbody"><tr><td colspan="7" style="text-align:center;color:#999;">无持仓</td></tr></tbody>
         </table>
       </div>
 
@@ -133,16 +133,24 @@ async function api(url, data) {
 function fmt(num, d=2) { return typeof num==='number' ? num.toFixed(d) : (num||'-'); }
 
 async function loadSymbols() {
-  const data = await api('/api/symbols');
-  if (Array.isArray(data)) {
-    symbols = data.sort((a,b) => (b.latest_apy||0) - (a.latest_apy||0));
-    const sel = document.getElementById('symbol-select');
-    sel.innerHTML = '';
-    for (const s of symbols) {
-      const apy = s.latest_apy != null ? ` (${s.latest_apy}%APY)` : '';
-      sel.innerHTML += `<option value="${s.symbol}">${s.symbol}${apy} | 杠杆${s.max_leverage.toFixed(1)}x | 抵押${(s.haircut*100).toFixed(0)}%</option>`;
+  const sel = document.getElementById('symbol-select');
+  try {
+    const data = await api('/api/symbols');
+    if (Array.isArray(data) && data.length > 0) {
+      symbols = data.sort((a,b) => (b.latest_apy||0) - (a.latest_apy||0));
+      sel.innerHTML = '';
+      for (const s of symbols) {
+        const apy = s.latest_apy != null ? ` (${s.latest_apy}%APY)` : '';
+        const lev = s.max_leverage > 0 ? s.max_leverage.toFixed(1) : 'N/A';
+        const hc = ((s.haircut||0)*100).toFixed(0);
+        sel.innerHTML += `<option value="${s.symbol}">${s.symbol}${apy} | 杠杆${lev}x | 抵押${hc}%</option>`;
+      }
+      onSymbolChange();
+    } else {
+      sel.innerHTML = '<option>加载失败，请刷新</option>';
     }
-    onSymbolChange();
+  } catch(e) {
+    sel.innerHTML = `<option>加载异常: ${e.message}</option>`;
   }
 }
 
@@ -175,11 +183,14 @@ async function refresh() {
   BTN_C.disabled = posEntries.length === 0;
 
   if (posEntries.length > 0) {
-    posTbody.innerHTML = posEntries.map(([sym, pos]) =>
-      `<tr><td>${sym}</td><td class="pos-qty">${fmt(pos.qty,4)}</td><td>${fmt(pos.notional,0)}</td><td>${fmt(pos.entry_price,2)}</td><td>${(pos.entry_time||'').slice(0,16)}</td></tr>`
-    ).join('');
+    posTbody.innerHTML = posEntries.map(([sym, pos]) => {
+      const pnl = pos.pnl != null ? pos.pnl.toFixed(2) : '-';
+      const pnlColor = pos.pnl > 0 ? '#2ecc71' : (pos.pnl < 0 ? '#e74c3c' : '#999');
+      const fr = pos.funding_rate != null ? `${pos.funding_rate}%` : '-';
+      return `<tr><td>${sym}</td><td class="pos-qty">${fmt(pos.qty,4)}</td><td>${fmt(pos.notional,0)}</td><td>${fmt(pos.entry_price,2)}</td><td style="color:${pnlColor};font-weight:600;">${pnl}</td><td>${fr}</td><td>${(pos.entry_time||'').slice(0,16)}</td></tr>`;
+    }).join('');
   } else {
-    posTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">无持仓</td></tr>';
+    posTbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;">无持仓</td></tr>';
   }
 
   // 订单
@@ -205,7 +216,7 @@ async function refresh() {
   document.getElementById('log-container').innerHTML = logs.map(l => `<div>${l}</div>`).join('');
 
   // 保证金率
-  document.getElementById('margin-rate').textContent = '-';
+  document.getElementById('margin-rate').textContent = state.maintenance_margin_ratio || '-';
 }
 
 async function doOpen() {

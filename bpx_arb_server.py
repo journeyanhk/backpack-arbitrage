@@ -25,7 +25,7 @@ from bpx_stock import PublicStock
 from bpx.account import Account
 
 # ---- 配置 ----
-PORT = 6000
+PORT = 5055
 DRY_RUN = True                     # 默认演练模式
 PAIR_TIMEOUT_S = 180               # 单对超时秒数（3分钟）
 MAX_RETRIES = 3                    # 最大重挂次数
@@ -411,12 +411,45 @@ def api_symbols():
 @app.route("/api/state")
 def api_state():
     """返回当前状态"""
+    # 给持仓补上盈亏和费率
+    enriched = {}
+    for sym, pos in position_state.items():
+        pos_copy = dict(pos)
+        pos_copy["pnl"] = None
+        pos_copy["funding_rate"] = None
+        try:
+            ticker = pub.get_ticker(pos["spot_sym"], source="External")
+            if isinstance(ticker, dict) and ticker.get("lastPrice"):
+                current = float(ticker["lastPrice"])
+                pos_copy["current_price"] = current
+                pos_copy["pnl"] = (current - pos["entry_price"]) * pos["qty"]
+            fr = pub.get_funding_interval_rates(f"{sym}_USDC_PERP", limit=1)
+            if isinstance(fr, list) and fr:
+                rate = float(fr[0].get("fundingRate", 0))
+                pos_copy["funding_rate"] = round(rate * 24 * 365 * 100, 1)
+        except Exception:
+            pass
+        enriched[sym] = pos_copy
+
+    # 维持保证金率
+    maintenance_margin_ratio = None
+    if account and not DRY_RUN:
+        try:
+            cfg = account.get_account()
+            acc = account.http_client.get(cfg.url, headers=cfg.headers)
+            if isinstance(acc, dict):
+                # leverageLimit 可作为近似参考
+                maintenance_margin_ratio = acc.get("positionLimit", acc.get("leverageLimit"))
+        except Exception:
+            pass
+
     state = {
         "dry_run": DRY_RUN,
         "has_key": bool(BPX_PUBLIC_KEY and BPX_SECRET_KEY),
-        "positions": position_state,
+        "positions": enriched,
         "active_orders": active_orders,
         "logs": operation_log[-30:],
+        "maintenance_margin_ratio": maintenance_margin_ratio,
     }
     # 账户余额
     if account and not DRY_RUN:
