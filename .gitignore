@@ -3,3 +3,6 @@ funding_signal.html
 _push_msg.txt
 bpx_trader.log
 BackPack资金费率套利信号器.html
+__pycache__/
+bpx_arb.log
+.workbuddy/
