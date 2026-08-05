@@ -74,7 +74,9 @@ def build_signals(pub: PublicStock, min_rate: float) -> List[dict]:
         if not rates:
             return None
 
-        latest = rates[-1]
+        # 最新费率取最近 3 期均值，避免单点异常值（恰逢该小时费率脉冲反转）
+        latest_3 = rates[-3:] if len(rates) >= 3 else rates[-1:]
+        latest_rate = sum(latest_3) / len(latest_3)
         week = rates[-WEEK_HOURS:] if len(rates) >= WEEK_HOURS else rates
         month = rates
 
@@ -92,8 +94,8 @@ def build_signals(pub: PublicStock, min_rate: float) -> List[dict]:
             "spot_leverage_str": f"{spot_lev:.1f}x" if spot_lev else "N/A",
             "perp_leverage_str": f"{perp_lev:.1f}x" if perp_lev else "N/A",
             "haircut_base": hc_base,
-            "latest_rate": latest,
-            "latest_apy": annualize(latest),
+            "latest_rate": latest_rate,
+            "latest_apy": annualize(latest_rate),
             "week_avg_raw": sum(week) / len(week),
             "week_avg_apy": annualize(sum(week) / len(week)),
             "month_avg_raw": sum(month) / len(month),
