@@ -625,8 +625,9 @@ def _build_state() -> dict:
             collateral_data = _get_collateral_data(ex) or {}
             collateral_items = collateral_data.get("collateral", []) or []
             total_assets_value = float(collateral_data.get("assetsValue", 0))
-            mmf = float(collateral_data.get("mmf", 0))
-            maintenance_margin = round(mmf * 100, 1) if mmf > 0 else None
+            # marginFraction 是账户级实际维持保证金率（已经是百分比数值，如 2.043 表示 2.0%）
+            mf = float(collateral_data.get("marginFraction", 0))
+            maintenance_margin = round(mf, 1) if mf > 0 else None
         except Exception:
             collateral_data = {}
             collateral_items = []
