@@ -9,6 +9,12 @@
 ![Flask](https://img.shields.io/badge/Flask-3.0+-green)
 ![ccxt](https://img.shields.io/badge/ccxt-4.5+-orange)
 
+> ⚠️ **Important / 重要提示**
+>
+> This script uses a **spot-long + perpetual-short** delta-neutral arbitrage model, suitable for most **positive funding rate** scenarios. Negative funding rate scenarios are rare and **not monitored or traded** by this bot.
+>
+> 本脚本基于【买入现货 + 做空合约】的中性套利模式，适应大部分**正资金费率**场景。负资金费率场景较为罕见，**未纳入监测和交易**。
+
 ---
 
 ## 📖 Table of Contents / 目录
