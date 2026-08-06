@@ -2,7 +2,10 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Backpack 资金费率套利交易</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Backpack 资金费率套利交易 v2</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, 'Microsoft YaHei', sans-serif; background: #f7f8fa; color: #333; padding: 16px; }
@@ -92,8 +95,8 @@
       <div class="panel">
         <h2>当前持仓</h2>
         <table>
-          <thead><tr><th>币种</th><th>数量</th><th>名义(USDC)</th><th>入场价</th><th>盈亏(USDC)</th><th>费率(APY)</th><th>开仓时间</th></tr></thead>
-          <tbody id="pos-tbody"><tr><td colspan="7" style="text-align:center;color:#999;">无持仓</td></tr></tbody>
+          <thead><tr><th>币种</th><th>市场</th><th>数量</th><th>入场价</th><th>现价</th><th>名义(USDC)</th><th>盈亏(USDC)</th><th>费率(APY)</th></tr></thead>
+          <tbody id="pos-tbody"><tr><td colspan="8" style="text-align:center;color:#999;">无持仓</td></tr></tbody>
         </table>
       </div>
 
@@ -101,8 +104,8 @@
       <div class="panel">
         <h2>活跃订单</h2>
         <table>
-          <thead><tr><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th></tr></thead>
-          <tbody id="ord-tbody"><tr><td colspan="5" style="text-align:center;color:#999;">无活跃订单</td></tr></tbody>
+          <thead><tr><th>市场</th><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th></tr></thead>
+          <tbody id="ord-tbody"><tr><td colspan="6" style="text-align:center;color:#999;">无活跃订单</td></tr></tbody>
         </table>
       </div>
 
@@ -172,8 +175,9 @@ async function refresh() {
 
   // 余额
   const balances = state.balances || [];
-  const usdc = balances.find(b => b.asset === 'USDC' || (b.symbol||'').includes('USDC'));
-  document.getElementById('bal-usdc').textContent = usdc ? fmt(usdc.available||usdc.free) : '-';
+  // 余额用 total_assets_value（含借出）
+  const usdc = balances.find(b => b.asset === 'USDC');
+  document.getElementById('bal-usdc').textContent = usdc ? fmt(usdc.total_notional, 2) : (state.total_assets_value ? fmt(state.total_assets_value, 2) : '-');
 
   // 持仓
   const positions = state.positions || {};
@@ -184,16 +188,31 @@ async function refresh() {
 
   if (posEntries.length > 0) {
     posTbody.innerHTML = posEntries.map(([sym, pos]) => {
-      const pnl = pos.pnl != null ? pos.pnl.toFixed(2) : '-';
-      const pnlColor = pos.pnl > 0 ? '#2ecc71' : (pos.pnl < 0 ? '#e74c3c' : '#999');
       const fr = pos.funding_rate != null ? `${pos.funding_rate}%` : '-';
-      return `<tr><td>${sym}</td><td class="pos-qty">${fmt(pos.qty,4)}</td><td>${fmt(pos.notional,0)}</td><td>${fmt(pos.entry_price,2)}</td><td style="color:${pnlColor};font-weight:600;">${pnl}</td><td>${fr}</td><td>${(pos.entry_time||'').slice(0,16)}</td></tr>`;
+      let rows = '';
+      // 现货行
+      const spotNotional = pos.spot_price ? pos.spot_qty * pos.spot_price : (pos.spot_value || 0);
+      rows += '<tr><td><strong>' + sym + '</strong></td>';
+      rows += '<td>现货</td><td class="pos-qty">' + fmt(pos.spot_qty,2) + '</td>';
+      rows += '<td>-</td><td>' + fmt(pos.spot_price,6) + '</td><td>' + fmt(spotNotional,0) + '</td>';
+      rows += '<td style="color:#999;">-</td>';
+      rows += '<td>-</td></tr>';
+      // 合约行
+      const perpNotional = pos.perp_qty * pos.perp_mark;
+      const perpPnl = (pos.perp_pnl_unrealized||0) + (pos.perp_pnl_realized||0) + (pos.perp_pnl_funding||0);
+      const perpPnlColor = perpPnl > 0 ? '#2ecc71' : (perpPnl < 0 ? '#e74c3c' : '#999');
+      rows += '<tr><td><strong>' + sym + '</strong></td>';
+      rows += '<td>合约</td><td class="pos-qty">' + fmt(pos.perp_qty,2) + '</td>';
+      rows += '<td>' + fmt(pos.perp_entry,6) + '</td><td>' + fmt(pos.perp_mark,6) + '</td><td>' + fmt(perpNotional,0) + '</td>';
+      rows += '<td style="color:'+perpPnlColor+';font-weight:600;">' + fmt(perpPnl,4) + '</td>';
+      rows += '<td>'+fr+'</td></tr>';
+      return rows;
     }).join('');
   } else {
-    posTbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;">无持仓</td></tr>';
+    posTbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#999;">无持仓</td></tr>';
   }
 
-  // 订单
+  // 订单（后端按币种基名分组, base=基名如MON, o.sym=ccxt全名如MON/USDC）
   const orders = state.active_orders || {};
   const ordTbody = document.getElementById('ord-tbody');
   const ordEntries = Object.entries(orders);
@@ -201,14 +220,25 @@ async function refresh() {
 
   if (ordEntries.length > 0) {
     let rows = '';
-    for (const [sym, ords] of ordEntries) {
-      for (const o of ords) {
-        rows += `<tr><td>${sym}</td><td>${o.side||'-'}</td><td>${fmt(o.qty,4)}</td><td>${fmt(o.price,4)}</td><td>${o.status||'-'}</td></tr>`;
-      }
+    for (const [base, ords] of ordEntries) {
+      const spotOrds = ords.filter(o => (o.market||'') === '现货');
+      const perpOrds = ords.filter(o => (o.market||'') === '合约');
+      // 现货行
+      rows += '<tr><td>现货</td><td><strong>'+base+'</strong></td>';
+      rows += '<td>'+(spotOrds.length>0 ? (spotOrds[0].side==='buy'?'买':'卖') : '-')+'</td>';
+      rows += '<td>'+(spotOrds.length>0 ? fmt(spotOrds.reduce((s,o)=>s+(o.executedQty||o.qty||0),0),2) : '-')+'</td>';
+      rows += '<td>'+(spotOrds.length>0 ? fmt(spotOrds[0].price,8) : '-')+'</td>';
+      rows += '<td>'+(spotOrds.length>0 ? '活跃' : '-')+'</td></tr>';
+      // 合约行
+      rows += '<tr><td>合约</td><td><strong>'+base+'</strong></td>';
+      rows += '<td>'+(perpOrds.length>0 ? (perpOrds[0].side==='buy'?'买':'卖') : '-')+'</td>';
+      rows += '<td>'+(perpOrds.length>0 ? fmt(perpOrds.reduce((s,o)=>s+(o.executedQty||o.qty||0),0),2) : '-')+'</td>';
+      rows += '<td>'+(perpOrds.length>0 ? fmt(perpOrds[0].price,8) : '-')+'</td>';
+      rows += '<td>'+(perpOrds.length>0 ? '活跃' : '-')+'</td></tr>';
     }
     ordTbody.innerHTML = rows;
   } else {
-    ordTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">无活跃订单</td></tr>';
+    ordTbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999;">无活跃订单</td></tr>';
   }
 
   // 日志
@@ -216,16 +246,18 @@ async function refresh() {
   document.getElementById('log-container').innerHTML = logs.map(l => `<div>${l}</div>`).join('');
 
   // 保证金率
-  document.getElementById('margin-rate').textContent = state.maintenance_margin_ratio || '-';
+  document.getElementById('margin-rate').textContent = state.maintenance_margin_ratio != null ? state.maintenance_margin_ratio + '%' : '-';
 }
 
 async function doOpen() {
   const sym = document.getElementById('symbol-select').value;
   const notional = parseFloat(document.getElementById('notional').value);
   const leverage = parseFloat(document.getElementById('leverage').value);
+  const orderSize = parseFloat(document.getElementById('order-size')?.value || '100');
+  const timeout = parseInt(document.getElementById('timeout')?.value || '180');
   if (!sym || !notional || notional <= 0) return alert('请填写币种和金额');
   BTN_O.disabled = true;
-  const r = await api('/api/open', { symbol: sym, notional, leverage });
+  const r = await api('/api/open', { symbol: sym, notional, leverage, order_size: orderSize, timeout });
   BTN_O.disabled = false;
   alert(r.ok ? `开仓完成 ${r.pairs_done}/${r.pairs_total} 对` : `开仓失败: ${r.error||r}`);
   await refresh();
@@ -233,9 +265,10 @@ async function doOpen() {
 
 async function doClose() {
   const sym = document.getElementById('symbol-select').value;
+  const orderSize = parseFloat(document.getElementById('order-size')?.value || '100');
   if (!sym) return;
   BTN_C.disabled = true;
-  const r = await api('/api/close', { symbol: sym });
+  const r = await api('/api/close', { symbol: sym, order_size: orderSize });
   BTN_C.disabled = false;
   alert(r.ok ? `平仓完成 ${r.pairs_done}/${r.pairs_total} 对` : `平仓失败: ${r.error||r}`);
   await refresh();

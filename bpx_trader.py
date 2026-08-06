@@ -54,7 +54,7 @@ from bpx.account import Account
 
 # ---------------- 配置 ----------------
 
-DEFAULT_SYMBOLS = ["MU.US_USDC", "SNDK.US_USDC", "SKHY.US_USDC", "SPCX.US_USDC"]
+DEFAULT_SYMBOLS = ["MON_USDC", "SOL_USDC", "HYPE_USDC"]
 CHECK_INTERVAL = 20          # 主循环周期（秒）
 BID_OFFSET = 0.002           # 买单低于参考价比例（0.2%）
 ASK_OFFSET = 0.002           # 卖单高于参考价比例
@@ -64,7 +64,7 @@ DEFAULT_QTY = 10             # 默认每方向股数（会被会话约束 clamp�
 CLIENT_ID_PREFIX = 8402      # clientId 前缀，用于识别本脚本的订单
 LOG_FILE = "bpx_trader.log"
 
-SESSION_ORDERBOOK = {"US_EQUITIES_PRE_MARKET", "US_EQUITIES_POST_MARKET", "US_EQUITIES_OVERNIGHT"}
+SESSION_ORDERBOOK = {"US_EQUITIES_PRE_MARKET", "US_EQUITIES_POST_MARKET", "US_EQUITIES_OVERNIGHT", "CRYPTO_ACTIVE"}
 SESSION_REGULAR = "US_EQUITIES_REGULAR"
 SESSION_SHUTDOWN = "SHUTDOWN"
 
@@ -72,9 +72,12 @@ SESSION_SHUTDOWN = "SHUTDOWN"
 class SessionEngine:
     """时段引擎：按美东时间 + 节假日判定当前会话（不依赖 startWeekday 的猜测）。"""
 
-    def __init__(self, pub: PublicStock):
+    def __init__(self, pub: PublicStock, symbols: List[str]):
         self.pub = pub
-        self.holiday_dates = self._load_holidays()
+        self.symbols = symbols
+        # ★ 加密货币没有美股时段，直接返回 CRYPTO_ACTIVE
+        self.is_crypto = all(".US_" not in s for s in symbols)
+        self.holiday_dates = self._load_holidays() if not self.is_crypto else set()
 
     def _load_holidays(self) -> set:
         try:
@@ -109,7 +112,9 @@ class SessionEngine:
         return now.replace(tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=offset)))
 
     def current_session(self) -> str:
-        """返回当前会话名（4 个 US_EQUITIES_* 之一或 SHUTDOWN）。"""
+        """返回当前会话名。加密货币 24/7 返回 CRYPTO_ACTIVE。"""
+        if self.is_crypto:
+            return "CRYPTO_ACTIVE"
         now = self._ny_now()
         # 节假日判定（用纽约日期）
         ny_date = now.strftime("%Y-%m-%d")
@@ -142,8 +147,46 @@ class MakerStrategy:
         self.symbols = symbols
         self.dry_run = dry_run
         self.sessions = self._load_session_constraints()
-        self.engine = SessionEngine(pub)
+        self.engine = SessionEngine(pub, symbols)
         self.last_ref = {}   # symbol -> (price, ts)
+        self._filters: Dict[str, dict] = {}     # ★ N3: 精度过滤器缓存
+        self._load_filters()
+
+    def _load_filters(self):
+        """★ N3: 从 get_markets() 加载 tickSize/stepSize"""
+        try:
+            ms = self.pub.get_markets()
+            for m in ms if isinstance(ms, list) else []:
+                sym = m.get("symbol", "")
+                f = m.get("filters", {})
+                if not sym or not f:
+                    continue
+                self._filters[sym] = {
+                    "tickSize": float(f["price"]["tickSize"]),
+                    "stepSize": float(f["quantity"]["stepSize"]),
+                    "minQty": float(f["quantity"]["minQuantity"]),
+                    "maxQty": float(f["quantity"].get("maxQuantity", 0) or 1e18),
+                }
+            logging.info("已加载 %d 个市场过滤器", len(self._filters))
+        except Exception as e:
+            logging.warning("加载过滤器失败: %s，回退 hardcoded 精度", e)
+
+    def _quantize_price(self, symbol: str, price: float) -> float:
+        f = self._filters.get(symbol, {})
+        tick = f.get("tickSize")
+        if not tick:
+            return round(price, 4)
+        return round(round(price / tick) * tick, 8)
+
+    def _quantize_qty(self, symbol: str, qty: float) -> float:
+        f = self._filters.get(symbol, {})
+        step = f.get("stepSize")
+        if not step:
+            return round(qty, 4)
+        q = round(qty / step) * step
+        return max(f.get("minQty", step), min(f.get("maxQty", 1e18), q))
+        self._filters: Dict[str, dict] = {}     # ★ N3: 精度过滤器缓存
+        self._load_filters()
 
     def _load_session_constraints(self) -> Dict[str, dict]:
         """每只股票各会话的数量约束 {symbol: {SESSION: (min, max, step)}}。"""
@@ -179,12 +222,13 @@ class MakerStrategy:
         return max(mn, qty)
 
     def get_ref_price(self, symbol: str) -> Optional[float]:
-        """参考价：优先 depth 中价（订单簿开放时最实时），回退 External ticker lastPrice。"""
+        """参考价：优先 depth 中价（订单簿开放时最实时），回退 External ticker lastPrice。
+        ★ 修复: bids 数组升序，bids[-1] 才是买一"""
         try:
             d = self.pub.get_depth(symbol)
             if isinstance(d, dict) and d.get("asks") and d.get("bids"):
                 best_ask = float(d["asks"][0][0])
-                best_bid = float(d["bids"][0][0])
+                best_bid = float(d["bids"][-1][0])   # ★ bids[-1] = 买一
                 if best_ask > 0 and best_bid > 0:
                     return (best_ask + best_bid) / 2
         except Exception as e:
@@ -209,8 +253,9 @@ class MakerStrategy:
             if not price:
                 plan["symbols"][sym] = {"action": "WAIT", "session": session, "detail": "无参考价，跳过本轮"}
                 continue
-            bid = round(price * (1 - BID_OFFSET), 4)
-            ask = round(price * (1 + ASK_OFFSET), 4)
+            # ★ N3: 按 tickSize 量化价格
+            bid = self._quantize_price(sym, price * (1 - BID_OFFSET))
+            ask = self._quantize_price(sym, price * (1 + ASK_OFFSET))
             drift = 0.0
             if sym in self.last_ref and self.last_ref[sym][0]:
                 drift = abs(price - self.last_ref[sym][0]) / self.last_ref[sym][0]
@@ -244,38 +289,45 @@ class Trader:
         return int(f"{CLIENT_ID_PREFIX}{int(time.time()) % 100000000}")
 
     def get_open_orders(self, symbol: str) -> List[dict]:
+        """★ 修复: get_open_orders(market_type) 第一个位置参数是 market_type，
+        传 symbol 必须用关键字参数 symbol=symbol"""
         if not self.account:
             return []
-        cfg = self.account.get_open_orders(symbol)
-        return self.account.http_client.get(cfg.url, headers=cfg.headers) or []
+        resp = self.account.get_open_orders(symbol=symbol)
+        return resp if isinstance(resp, list) else []
 
     def cancel_all(self, symbol: str):
+        """★ 修复: account.cancel_all_orders() 已执行 DELETE, 不再二次 http_client.delete"""
         action = f"撤单 {symbol}（全部）"
         if self.dry_run:
             logging.info("[DRY] %s", action)
             return
-        cfg = self.account.cancel_all_orders(symbol)
-        self.account.http_client.delete(cfg.url, headers=cfg.headers, data=cfg.data)
+        self.account.cancel_all_orders(symbol)
         logging.info("%s 完成", action)
 
-    def place_orders(self, symbol: str, bid: float, ask: float, qty: float, session: str):
+    def place_orders(self, symbol: str, bid: float, ask: float, qty: float, session: str, strat=None):
+        """★ 修复: 精度按 filters 量化, 直接拿 execute_order 返回值"""
+        # ★ N3: 从 strat 取量化方法（Trader 自己没有 _quantize_*）
+        q_price = strat._quantize_price if strat and hasattr(strat, '_quantize_price') else lambda s,p: round(p,4)
+        q_qty = strat._quantize_qty if strat and hasattr(strat, '_quantize_qty') else lambda s,q: round(q,4)
         for side, price in (("Bid", bid), ("Ask", ask)):
-            action = f"挂单 {symbol} {side} {qty}股 @ {price}（postOnly, {session}）"
+            action = f"挂单 {symbol} {side} {qty} @ {price}（postOnly, {session}）"
             if self.dry_run:
                 logging.info("[DRY] %s", action)
                 continue
-            cfg = self.account.execute_order(
+            pq = q_qty(symbol, qty)
+            pp = q_price(symbol, price)
+            resp = self.account.execute_order(
                 symbol=symbol,
                 side=side,
                 order_type="Limit",
                 time_in_force="GTC",
-                quantity=str(qty),
-                price=str(price),
+                quantity=str(pq),
+                price=str(pp),
                 post_only=True,
                 self_trade_prevention="RejectTaker",
                 client_id=self._client_id(),
             )
-            resp = self.account.http_client.post(cfg.url, headers=cfg.headers, data=cfg.data)
             logging.info("%s -> %s", action, json.dumps(resp, ensure_ascii=False)[:200])
 
 
@@ -317,7 +369,7 @@ def main():
                 elif p["action"] == "REFRESH":
                     trader.cancel_all(sym)
                     qty = strat.clamp_qty(sym, session, DEFAULT_QTY)
-                    trader.place_orders(sym, p["bid"], p["ask"], qty, session)
+                    trader.place_orders(sym, p["bid"], p["ask"], qty, session, strat=strat)
                 else:
                     logging.info("[%s] %s %s", session, sym, p["detail"])
         except KeyboardInterrupt:

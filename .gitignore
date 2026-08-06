@@ -6,3 +6,7 @@ BackPack资金费率套利信号器.html
 __pycache__/
 bpx_arb.log
 .workbuddy/
+.env
+.venv/
+.cache_*.py
+startup.log
