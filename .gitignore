@@ -10,3 +10,9 @@ bpx_arb.log
 .venv/
 .cache_*.py
 startup.log
+# 旧版文件（本地保留作参考，公仓只保留 ccxt 重写版）
+bpx_arb_server.py
+bpx_trader.py
+bpx_stock.py
+test_bpx_stock.py
+bpx_signal.py
