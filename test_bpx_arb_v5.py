@@ -60,6 +60,24 @@ class FakeExchange:
         self._seq = 0
         self._dry_mode = False
         self.auto_fill = False   # True 时下单即全成（测试用）
+        # ★ 模拟 backpack: 不支持 fetchOrder，支持 open orders/history/trades
+        self.has = {"fetchOrder": False, "fetchOrders": True,
+                    "fetchOpenOrders": True, "fetchMyTrades": True}
+
+    def _order_view(self, oid):
+        st = self.order_state[oid]
+        return {"id": oid, "status": st["status"], "filled": st["filled"],
+                "amount": st["amount"], "price": 0, "symbol": "?"}
+
+    def fetch_open_orders(self, symbol=None):
+        return [self._order_view(oid) for oid, st in self.order_state.items()
+                if st["status"] == "open"]
+
+    def fetch_orders(self, symbol=None):
+        return [self._order_view(oid) for oid in self.order_state]
+
+    def fetch_my_trades(self, symbol=None):
+        return []
 
     def fetch_order_book(self, symbol, limit=5):
         if symbol not in self.bbo:
@@ -105,9 +123,6 @@ class FakeExchange:
         if order_id not in self.order_state and order_id not in self.order_not_found:
             raise ccxt.OrderNotFound(f"order not found {order_id}")
         self.cancelled.append(order_id)
-
-    def fetch_open_orders(self, symbol=None):
-        return []
 
     def fetch_positions(self):
         return self.positions
@@ -164,11 +179,34 @@ class TestCheckOrderStatus(unittest.TestCase):
         _install(self.ex)
 
     def test_order_not_found_is_unknown(self):
-        """OrderNotFound → UNKNOWN，绝不伪造成交"""
-        self.ex.order_not_found.add("oid-1")
-        status, filled, _ = bpx._check_order_filled(self.ex, "MON/USDC", "oid-1")
+        """未成交/历史/成交记录都查不到 → UNKNOWN，绝不伪造成交"""
+        oid, _ = bpx._place_limit(bpx.ex, "MON/USDC", "buy", 500.0, 1.0, intent="open")
+        bpx.ex.fetch_open_orders = lambda symbol=None: []
+        bpx.ex.fetch_orders = lambda symbol=None: []
+        status, filled, _ = bpx._check_order_filled(bpx.ex, "MON/USDC", oid)
         self.assertEqual(status, "unknown")
         self.assertEqual(filled, 0.0)
+
+    def test_status_via_open_orders_and_history(self):
+        """★ backpack 不支持 fetchOrder: 用 open orders + 订单历史确认状态与成交量"""
+        self.ex.auto_fill = False
+        oid, coid = bpx._place_limit(bpx.ex, "MON/USDC", "buy", 500.0, 1.0, intent="open")
+        # 部分成交 200，仍在挂单
+        self.ex.order_state[oid]["filled"] = 200.0
+        status, filled, _ = bpx._check_order_filled(bpx.ex, "MON/USDC", oid)
+        self.assertEqual(status, "open")
+        self.assertEqual(filled, 200.0)
+        # 全部成交 → 订单归档（不在 open，从历史确认 closed）
+        self.ex.order_state[oid]["filled"] = 500.0
+        self.ex.order_state[oid]["status"] = "closed"
+        status, filled, _ = bpx._check_order_filled(bpx.ex, "MON/USDC", oid)
+        self.assertEqual(status, "closed")
+        self.assertEqual(filled, 500.0)
+        # 撤销 → canceled
+        self.ex.order_state[oid]["status"] = "canceled"
+        self.ex.order_state[oid]["filled"] = 0.0
+        status, filled, _ = bpx._check_order_filled(bpx.ex, "MON/USDC", oid)
+        self.assertEqual(status, "canceled")
 
 
 class TestExecutePair(unittest.TestCase):
@@ -262,20 +300,21 @@ class TestExecutePair(unittest.TestCase):
                     "filled": self.ex.order_state[oid]["filled"], "amount": amount,
                     "price": price, "average": None, "side": side, "symbol": symbol}
 
-        def fill2(order_id, symbol=None):
+        def open_orders_fake(symbol=None):
+            # 追单订单分两次成交: 先 200 再全量（驱动新查询路径 2a/2b）
             chase_oid = getattr(self.ex, "_chase_oid", None)
-            if chase_oid and order_id == chase_oid:
-                st = self.ex.order_state[order_id]
+            if chase_oid and chase_oid in self.ex.order_state:
+                st = self.ex.order_state[chase_oid]
                 if chase_state["filled"] == 0:
                     st["filled"] = 200.0
                     chase_state["filled"] = 200.0
                 else:
                     st["filled"] = st["amount"]
                     st["status"] = "closed"
-            return FakeExchange.fetch_order(self.ex, order_id, symbol)
+            return FakeExchange.fetch_open_orders(self.ex, symbol)
 
         bpx.ex.create_order = create
-        bpx.ex.fetch_order = fill2
+        bpx.ex.fetch_open_orders = open_orders_fake
         ok, s_f, p_f, msg = bpx.execute_pair("MON", 500.0, timeout_s=30)
         self.assertTrue(ok, msg)
         pos = bpx._get_strategy_position("MON")
@@ -298,11 +337,9 @@ class TestExecutePair(unittest.TestCase):
 
     def test_unknown_freezes_symbol(self):
         """订单状态 UNKNOWN → 冻结币种，不开新单"""
-        def fail_on_perp(order_id, symbol=None):
-            if symbol and ":USDC" in symbol:
-                raise ccxt.OrderNotFound("gone")
-            return FakeExchange.fetch_order(self.ex, order_id, symbol)
-        bpx.ex.fetch_order = fail_on_perp
+        # 订单在 open/history/trades 中都查不到 → UNKNOWN
+        bpx.ex.fetch_open_orders = lambda symbol=None: []
+        bpx.ex.fetch_orders = lambda symbol=None: []
         ok, s_f, p_f, msg = bpx.execute_pair("MON", 500.0, timeout_s=30)
         self.assertFalse(ok)
         self.assertIn("MON", bpx._frozen)

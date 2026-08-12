@@ -596,37 +596,85 @@ def _check_order_filled(exchange, ccxt_sym: str, order_id: str) -> Tuple[str, fl
     if DRY_RUN or not has_key:
         return "closed", 0.0, 0.0
 
-    def _read():
-        order = exchange.fetch_order(order_id, ccxt_sym)
-        status = order.get("status", "")
-        filled = float(order.get("filled", 0) or 0)
-        amount = float(order.get("amount", 0) or 0)
-        price = float(order.get("average", 0) or order.get("price", 0) or 0)
-        if status == "closed":
-            return "closed", filled, price
-        if status == "canceled":
-            return "canceled", filled, price
-        if status == "open" and amount > 0 and filled >= amount:
-            return "closed", filled, price
-        return "open", filled, price
+    # ★ 路径1: 交易所支持 fetchOrder（ccxt.backpack 不支持！返回 NotSupported）
+    if exchange.has.get("fetchOrder"):
+        def _read():
+            order = exchange.fetch_order(order_id, ccxt_sym)
+            status = order.get("status", "")
+            filled = float(order.get("filled", 0) or 0)
+            amount = float(order.get("amount", 0) or 0)
+            price = float(order.get("average", 0) or order.get("price", 0) or 0)
+            if status == "closed":
+                return "closed", filled, price
+            if status == "canceled":
+                return "canceled", filled, price
+            if status == "open" and amount > 0 and filled >= amount:
+                return "closed", filled, price
+            return "open", filled, price
 
-    try:
-        return _read()
-    except ccxt.OrderNotFound:
-        # 查不到：可能已成交归档/已撤销/节点不同步。短暂重试一次，仍未知则 UNKNOWN。
         try:
-            time.sleep(1)
             return _read()
-        except Exception:
-            add_log(f"[UNKNOWN] 订单 {order_id} 查询不到，状态未知（不假定成交，不重发同单）")
-            return "unknown", 0.0, 0.0
-    except ccxt.NetworkError as e:
-        # 网络抖动：视为仍挂单，下一轮继续查
-        add_log(f"[警告] 查单网络异常 {order_id}: {e}")
-        return "open", 0.0, 0.0
+        except ccxt.OrderNotFound:
+            # 查不到：可能已成交归档/已撤销/节点不同步。短暂重试一次，仍未知则 UNKNOWN。
+            try:
+                time.sleep(1)
+                return _read()
+            except Exception:
+                add_log(f"[UNKNOWN] 订单 {order_id} 查询不到，状态未知（不假定成交，不重发同单）")
+                return "unknown", 0.0, 0.0
+        except ccxt.NetworkError as e:
+            # 网络抖动：视为仍挂单，下一轮继续查
+            add_log(f"[警告] 查单网络异常 {order_id}: {e}")
+            return "open", 0.0, 0.0
+        except Exception as e:
+            add_log(f"[警告] 查单异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
+            return "open", 0.0, 0.0
+
+    # ★ 路径2: backpack 等不支持 fetchOrder → 三级对账（未成交 → 订单历史 → 成交记录）
+    # 2a. 未成交订单列表（部分成交也在此，filled 即已成交量）
+    try:
+        opens = exchange.fetch_open_orders(ccxt_sym) or []
+        for o in opens:
+            if str(o.get("id")) == str(order_id):
+                filled = float(o.get("filled", 0) or 0)
+                amount = float(o.get("amount", 0) or 0)
+                if amount > 0 and filled >= amount:
+                    return "closed", filled, 0.0
+                return "open", filled, 0.0
     except Exception as e:
-        add_log(f"[警告] 查单异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
+        add_log(f"[警告] 查未成交订单异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
         return "open", 0.0, 0.0
+
+    # 2b. 不在未成交列表 → 查订单历史确认最终状态与成交量
+    try:
+        orders = exchange.fetch_orders(ccxt_sym) or []
+        for o in orders:
+            if str(o.get("id")) == str(order_id):
+                status = o.get("status", "")
+                filled = float(o.get("filled", 0) or 0)
+                amount = float(o.get("amount", 0) or 0)
+                if status == "closed":
+                    return "closed", filled, 0.0
+                if status == "open":
+                    return "open", filled, 0.0
+                return "canceled", filled, 0.0
+    except Exception as e:
+        add_log(f"[警告] 查订单历史异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
+
+    # 2c. 历史也没有 → 用成交记录兜底（部分交易所成交后订单立即归档）
+    try:
+        trades = exchange.fetch_my_trades(ccxt_sym) or []
+        total = 0.0
+        for t in trades:
+            if str(t.get("order") or "") == str(order_id):
+                total += float(t.get("amount", 0) or 0)
+        if total > 0:
+            return "closed", total, 0.0
+    except Exception as e:
+        add_log(f"[警告] 查成交记录异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
+
+    add_log(f"[UNKNOWN] 订单 {order_id} 无法确认状态（不假定成交，不重发同单）")
+    return "unknown", 0.0, 0.0
 
 
 def _confirm_final_fill(ccxt_sym: str, order_id: str, client_order_id: str,
@@ -643,7 +691,7 @@ def _confirm_final_fill(ccxt_sym: str, order_id: str, client_order_id: str,
 
 def _cancel_order(ccxt_sym: str, order_id: str, client_order_id: str,
                   symbol: str, market: str, side: str) -> bool:
-    """撤单并重确认最终成交量。返回是否已撤（订单不再挂单）。"""
+    """撤单并重确认最终成交量。返回订单是否已不在挂单（撤单成功或订单已关闭）。"""
     if order_id.startswith("dry-"):
         add_log(f"[DRY] 撤单 {ccxt_sym} {order_id}")
         _confirm_final_fill(ccxt_sym, order_id, client_order_id, symbol, market, side)
@@ -653,6 +701,13 @@ def _cancel_order(ccxt_sym: str, order_id: str, client_order_id: str,
         add_log(f"撤单 {ccxt_sym} {order_id}")
     except ccxt.OrderNotFound:
         add_log(f"撤单 {ccxt_sym} {order_id}: 订单已不存在（可能已成交），重新确认最终量")
+    except ccxt.BadRequest as e:
+        # backpack 对已关闭订单撤单返回 BadRequest("Order not found")，等同 OrderNotFound
+        if "not found" in str(e).lower() or "INVALID_CLIENT_REQUEST" in str(e):
+            add_log(f"撤单 {ccxt_sym} {order_id}: 订单已不存在（可能已成交），重新确认最终量")
+        else:
+            add_log(f"[FAIL] 撤单 {ccxt_sym} {order_id}: {str(e)[:120]}")
+            return False
     except Exception as e:
         add_log(f"[FAIL] 撤单 {ccxt_sym} {order_id}: {type(e).__name__} {str(e)[:120]}")
         return False
