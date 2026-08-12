@@ -407,6 +407,8 @@ class TestClosePair(unittest.TestCase):
         self.assertNotIn("autoBorrow", spot["params"])
         self.assertNotIn("autoBorrow", perp["params"])
         self.assertIn("autoLendRedeem", spot["params"])
+        # ★ 平仓卖单必须带 autoBorrowRepay（卖出所得归还 USDC 借款）
+        self.assertTrue(spot["params"].get("autoBorrowRepay"))
         self.assertTrue(perp["params"].get("reduceOnly"))
         pos = bpx._get_strategy_position("MON")
         self.assertAlmostEqual(pos["spot_qty"], 0.0)
@@ -579,14 +581,14 @@ class TestOrderLookup(unittest.TestCase):
         self.assertEqual(bpx._check_order_filled(bpx.ex, "MON/USDC", "dry-123-1")[1], 500.0)
 
     def test_client_id_is_uint32_integer(self):
-        """★ Backpack 要求 clientId 为 uint32 整数，字符串会被 400 拒绝"""
+        """★ ccxt 文档参数 clientOrderId 必须为 uint32 整数（转成 Backpack clientId）"""
         self.ex = FakeExchange()
         _install(self.ex)
         self.ex.auto_fill = True
         bpx.open_position("MON", 100, 1, order_size=100)
         for c in self.ex.created:
-            cid = c["params"].get("clientId")
-            self.assertIsInstance(cid, int, f"clientId 必须是整数，实际 {cid!r}")
+            cid = c["params"].get("clientOrderId")
+            self.assertIsInstance(cid, int, f"clientOrderId 必须是整数，实际 {cid!r}")
             self.assertTrue(1 <= cid <= 0xFFFFFFFF)
 
     def test_reconcile_detects_phantom_ledger(self):

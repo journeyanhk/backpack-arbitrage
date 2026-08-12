@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [5.0.3] - 2026-08-12
+
+### 修复
+- ★ 借贷闭环：平仓卖出现货增加 autoBorrowRepay（卖出所得自动归还 USDC 借款），债务不再残留
+- ★ 债务读取改用 collateral 顶层字段 borrowLiability（原查找的逐币种字段不存在，导致
+  "无法确认债务状态"；实测当前账户 borrowLiability=0，此前债务实际已由平台自动结清）
+- 债务未归零时平仓结果判定为不成功（ok=false），需人工处理（审计要求）
+- clientId 参数改用 ccxt 文档参数名 clientOrderId（自动转 uint32）
+
 ## [5.0.2] - 2026-08-12
 
 ### 修复

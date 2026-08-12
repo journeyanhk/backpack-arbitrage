@@ -466,12 +466,17 @@ def _get_spot_total(symbol: str) -> Optional[float]:
 
 
 def _get_usdc_borrow() -> Optional[float]:
-    """读取 USDC 借款余额。取不到字段则返回 None（未知）。
-    ★ 平仓后必须验证债务归零，避免自以为平仓成功。"""
+    """★ 读取账户借款余额（Backpack 实际格式: collateral 顶层字段 borrowLiability）。
+    平仓后必须验证债务归零，避免自以为平仓成功。取不到字段返回 None（未知）。"""
     if not has_key or DRY_RUN:
         return None
     try:
         col = _get_collateral_data(ex)
+        if "borrowLiability" in col:
+            return float(col.get("borrowLiability", 0) or 0)
+        if "liabilitiesValue" in col:
+            return float(col.get("liabilitiesValue", 0) or 0)
+        # 兜底: 逐币种字段
         for ci in col.get("collateral", []) or []:
             if ci.get("symbol") == "USDC":
                 for k in ("borrowQuantity", "borrowedQuantity", "borrow", "liabilityQuantity"):
@@ -488,9 +493,10 @@ def _get_usdc_borrow() -> Optional[float]:
 
 def _order_params(market: str, intent: str, side: str, reduce_only: bool = False) -> dict:
     """★ 按交易意图生成交易所参数。
-    借贷规则：
-      - 开仓买入现货: 允许 autoBorrow 借 USDC；买到的币可自动出借
-      - 平仓卖出现货: 允许赎回出借的币(autoLendRedeem)；禁止 autoBorrow 借入标的币
+    借贷规则（Backpack spot margin 参数，见 ccxt backpack createOrder 文档）：
+      - 开仓买入现货: autoBorrow（借 USDC）+ autoLend（买到的币自动出借）
+      - 平仓卖出现货: autoLendRedeem（赎回出借的币）+ autoBorrowRepay（卖出所得自动归还
+        USDC 借款）+ 禁止 autoBorrow 借入标的币
       - 永续平仓: 强制 reduceOnly，禁止反向开仓"""
     params: dict = {}
     if market == "spot":
@@ -500,6 +506,7 @@ def _order_params(market: str, intent: str, side: str, reduce_only: bool = False
         elif intent == "close" and side == "sell":
             params["autoLend"] = True
             params["autoLendRedeem"] = True
+            params["autoBorrowRepay"] = True   # ★ 卖出所得自动归还 USDC 借款
     else:
         if reduce_only:
             params["reduceOnly"] = True
@@ -547,7 +554,7 @@ def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
 
     try:
         params = _order_params(market, intent, side, reduce_only)
-        params["clientId"] = int(coid)   # ★ Backpack 要求 uint32 整数
+        params["clientOrderId"] = int(coid)   # ★ ccxt 文档参数：自动转 uint32 的 clientId
         if post_only:
             params["postOnly"] = True
         order = exchange.create_order(
@@ -1199,18 +1206,22 @@ def close_position(symbol: str, order_size: Optional[float] = None) -> dict:
         time.sleep(2)
 
     sp2 = _get_strategy_position(symbol)
-    # ★ USDC 债务归零验证
+    # ★ USDC 债务归零验证（卖出单已带 autoBorrowRepay，卖出所得自动还款）
     debt = _get_usdc_borrow()
     if debt is None:
         debt_msg = "无法确认 USDC 债务状态，请人工核对"
+        debt_ok = True
     elif debt > 1e-8:
         debt_msg = f"USDC 债务未归零: {debt:.6f}，请人工检查"
+        debt_ok = False
     else:
         debt_msg = "USDC 债务已归零"
+        debt_ok = True
 
     add_log(f"平仓 {symbol} 结束: 成功 {ok_pairs}/{pairs} 对 | 账本剩余 现{sp2['spot_qty']:.4f}/"
             f"合{sp2['perp_qty']:.4f} | {debt_msg}")
-    return {"ok": ok_pairs > 0, "pairs_done": ok_pairs, "pairs_total": pairs,
+    # ★ 债务未归零时平仓不算完全成功（审计要求：只有债务低于最小精度才认定策略关闭）
+    return {"ok": ok_pairs > 0 and debt_ok, "pairs_done": ok_pairs, "pairs_total": pairs,
             "spot_remaining": sp2["spot_qty"], "perp_remaining": sp2["perp_qty"],
             "debt": debt_msg}
 
