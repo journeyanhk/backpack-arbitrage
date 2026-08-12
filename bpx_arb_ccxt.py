@@ -888,9 +888,16 @@ def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S) -> Tu
                             break
                     p_done = _perp_done(symbol, perp_before)
                     if p_done < qty - 1e-8:
-                        # ★ 追单超时 → 回滚已成交现货，不继续裸露
-                        add_log(f"  ⚠ [{symbol}] 合约追单 {HEDGE_TIMEOUT_S}s 未成交，回滚现货 {s_done:.4f}")
-                        _rollback_open_leg(symbol, "spot", s_done)
+                        # ★ 追单超时: 必须先撤追单单并重确认最终量（防追单晚成交造成裸敞口），
+                        #    只回滚未对冲部分，绝不能在追单仍挂着时直接回滚
+                        if perp_oid:
+                            _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "sell")
+                            perp_oid = perp_coid = None
+                        p_done = _perp_done(symbol, perp_before)
+                        uncovered = max(0.0, s_done - p_done)
+                        if uncovered > 1e-8:
+                            add_log(f"  ⚠ [{symbol}] 合约追单 {HEDGE_TIMEOUT_S}s 未成交，回滚现货 {uncovered:.4f}")
+                            _rollback_open_leg(symbol, "spot", uncovered)
                         return False, s_done, p_done, "合约追单未成交，已回滚现货"
 
             # ★ 永续腿有成交、现货未满 → 立即追单买现货（可成交价）
@@ -924,8 +931,16 @@ def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S) -> Tu
                             break
                     s_done = _spot_done(symbol, spot_before)
                     if s_done < qty - 1e-8:
-                        add_log(f"  ⚠ [{symbol}] 现货追单 {HEDGE_TIMEOUT_S}s 未成交，回滚合约 {p_done:.4f}")
-                        _rollback_open_leg(symbol, "perp", p_done)
+                        # ★ 追单超时: 必须先撤追单单并重确认最终量（防追单晚成交造成裸敞口），
+                        #    只回滚未对冲部分
+                        if spot_oid:
+                            _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "buy")
+                            spot_oid = spot_coid = None
+                        s_done = _spot_done(symbol, spot_before)
+                        uncovered = max(0.0, p_done - s_done)
+                        if uncovered > 1e-8:
+                            add_log(f"  ⚠ [{symbol}] 现货追单 {HEDGE_TIMEOUT_S}s 未成交，回滚合约 {uncovered:.4f}")
+                            _rollback_open_leg(symbol, "perp", uncovered)
                         return False, s_done, p_done, "现货追单未成交，已回滚合约"
 
         # 超时：撤两腿（带重确认），记录本次成交，重挂

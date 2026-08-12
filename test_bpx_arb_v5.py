@@ -345,8 +345,9 @@ class TestExecutePair(unittest.TestCase):
         self.assertIn("MON", bpx._frozen)
 
     def test_rollback_on_chase_fail(self):
-        """永续追单超时未成交 → 回滚已成交现货（卖出），不继续裸露"""
+        """永续追单超时未成交 → 先撤追单单，再回滚已成交现货（不继续裸露）"""
         created = []
+        self.ex._chase_oid = None
 
         def create(symbol=None, type=None, side=None, amount=None, price=None, params=None):
             self.ex._seq += 1
@@ -355,6 +356,7 @@ class TestExecutePair(unittest.TestCase):
             # 追单（非 post_only 的合约卖单）永不成交
             if ":USDC" in symbol and side == "sell" and not (params or {}).get("postOnly"):
                 self.ex.order_state[oid] = {"status": "open", "filled": 0.0, "amount": amount}
+                self.ex._chase_oid = oid
             else:
                 self.ex.order_state[oid] = {"status": "open", "filled": 0.0, "amount": amount}
                 if symbol == "MON/USDC" and side == "buy" and (params or {}).get("postOnly"):
@@ -372,6 +374,8 @@ class TestExecutePair(unittest.TestCase):
         ok, s_f, p_f, msg = bpx.execute_pair("MON", 500.0, timeout_s=30)
         self.assertFalse(ok)
         self.assertEqual(s_f, 500.0)
+        # ★ 追单超时后必须撤掉追单单（防追单晚成交造成裸敞口）
+        self.assertIn(self.ex._chase_oid, self.ex.cancelled)
         # 回滚卖单存在: 现货卖出，价格=买一×(1-滑点)，intent=close（无 autoBorrow）
         rollbacks = [c for c in created if c[0] == "MON/USDC" and c[1] == "sell"]
         self.assertEqual(len(rollbacks), 1)
