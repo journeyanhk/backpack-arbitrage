@@ -1,41 +1,55 @@
 # -*- coding: utf-8 -*-
 """
-Backpack 资金费率套利交易脚本 v4.0 — ccxt 重写版 (2026-08-05)
+Backpack 资金费率套利交易脚本 v5.0 — ccxt 重写版 (2026-08-12)
 Flask 后端 + 前端操作面板
 
-端口 5055 | 实盘需 BPX_LIVE=1 环境变量
-底层：ccxt 4.5.71（官方 Backpack 支持）
+端口 5055 | 实盘需 BPX_LIVE=1 环境变量 | 默认 DRY-RUN
+底层：ccxt 4.x（官方 Backpack 支持）
 
 策略：
   现货腿永远 maker（买一价）| 合约腿初始 maker/post_only（卖一价）
-  一条腿成交后另一条改 taker（对手方最优价）
-  两腿都不动满 3 分钟 → 撤单重挂
+  一条腿有成交后另一条立即改可成交限价追单（带滑点上限）
+  追单超时（HEDGE_TIMEOUT_S）未成交 → 回滚已成交腿，避免裸敞口
+  两腿都不动满 PAIR_TIMEOUT_S → 撤单重挂，最多 MAX_RETRIES 次
 
-v4.0 改动：
-  ★ 底层从 bpx-py SDK 迁移到 ccxt 4.x
-  ★ 精度交给 ccxt（amount_to_precision / price_to_precision，TICK_SIZE 模式）
-  ★ bids 排序 ccxt 自动归一为降序（bids[0]=买一）
-  ★ 错误处理 ccxt 抛类型化异常（InvalidOrder / InsufficientFunds 等）
-  ★ 抵押品数据用 implicit API privateGetApiV1CapitalCollateral()
-  ★ 后端输出结构与前版 HTML 完全对齐
+v5.0 改动（按外部代码安全审计修复 P0/P1）：
+  ★ 追单/平仓价格方向修正：可成交限价（cross price + 滑点上限），不再反挂
+  ★ 永续平仓强制 reduceOnly，杜绝反向开仓
+  ★ 合约持仓按方向识别（signed contracts × contractSize 换算基础资产）
+  ★ OrderNotFound 不再伪造成交：状态分 open/closed/canceled/unknown，
+    unknown 冻结该币种并提示人工处理
+  ★ 撤单后重新确认最终成交量；所有记账按"已确认成交增量"驱动，杜绝漏记/重复
+  ★ SQLite 轻量账本（orders/fills/strategy_positions/tasks），重启可恢复
+  ★ 借贷按意图区分：仅开仓买入允许 autoBorrow（借 USDC）；平仓卖现货
+    禁止借入标的币，允许赎回出借；平仓后验证 USDC 债务归零
+  ★ 平仓只关闭账本记录的策略持仓，不动人工持仓；启动对账发现未知敞口禁止开仓
+  ★ 费率硬门槛：费率为负或净年化（含成本缓冲）不达标拒绝开仓，按实际结算周期年化
+  ★ leverage 真正参与目标名义计算（target_notional = notional × leverage）
+  ★ 服务只监听 127.0.0.1；POST 接口需 X-Auth-Token；实盘缺 key/缺 token 拒绝启动
+  ★ /api/open、/api/close 改为任务模式，后台结果可查询（/api/task/<id>）
+  ★ 交易错误响应脱敏，不向前端返回原始交易所错误
 """
-import json
+import hmac
 import logging
 import math
 import os
+import secrets
+import sqlite3
 import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from functools import wraps
+from typing import Dict, List, Optional, Tuple
 
 import ccxt
 from flask import Flask, jsonify, render_template, request
 
 # =====================================================================
-# 配置 — 沿用现有策略参数
+# 配置 — 沿用现有策略参数（含 v5.0 安全项）
 # =====================================================================
 PORT = 5055
+HOST = "127.0.0.1"              # ★ v5.0: 只监听本机，不再 0.0.0.0
 
 # ★ 先加载 .env，再读配置（否则 .env 里的 BPX_LIVE=1 拿不到）
 env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -49,11 +63,22 @@ if os.path.exists(env_file):
 
 DRY_RUN = os.environ.get("BPX_LIVE", "0").strip() != "1"
 ORDER_SIZE_USDC = 100.0            # 单笔名义 USDC
-PAIR_TIMEOUT_S = 180               # 单对超时秒数（3分钟）
+PAIR_TIMEOUT_S = 60                # 单对 maker 等待超时（原 180s，缩短裸露窗口）
+HEDGE_TIMEOUT_S = 5                # ★ 追单/回滚等待超时（审计建议 2-5s）
 MAX_RETRIES = 3                    # 最大重挂次数
-MIN_WEEK_APY = 10.0                # 费率警告阈值
+MIN_NET_APY = 10.0                 # ★ 费率硬门槛：年化低于此值拒绝开仓（原 MIN_WEEK_APY）
+EST_ROUND_TRIP_COST_APY = 5.0      # ★ 往返成本缓冲（手续费+滑点+基差）：净年化 ≤ 0 时拒绝开仓
+MAX_SLIPPAGE_BPS = 20              # ★ 追单/平仓可成交限价的滑点上限（0.2%）
+FUNDING_INTERVAL_DEFAULT_S = 3600  # ★ 资金费结算周期缺省值（Backpack 当前为小时级）
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arb_ledger.db")
 BPX_PUBLIC_KEY = os.environ.get("BPX_PUBLIC_KEY", "")
 BPX_SECRET_KEY = os.environ.get("BPX_SECRET_KEY", "")
+BPX_WEB_TOKEN = os.environ.get("BPX_WEB_TOKEN", "").strip()
+# ★ 可选代理（如 CLI 直连被墙、浏览器走系统代理时）:
+#   在 .env 里配置 BPX_PROXY=http://127.0.0.1:10808 即可（ccxt 不读环境变量代理，必须显式设置）
+BPX_PROXY = os.environ.get("BPX_PROXY", "").strip()
+if BPX_PROXY and not BPX_PROXY.startswith("http://") and not BPX_PROXY.startswith("https://"):
+    BPX_PROXY = f"http://{BPX_PROXY}"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +90,7 @@ logger = logging.getLogger("arb")
 app = Flask(__name__)
 
 # =====================================================================
-# 初始化 ccxt
+# 初始化 ccxt + 启动硬校验
 # =====================================================================
 has_key = bool(BPX_PUBLIC_KEY and BPX_SECRET_KEY)
 ex: ccxt.backpack = ccxt.backpack({
@@ -73,9 +98,21 @@ ex: ccxt.backpack = ccxt.backpack({
     "secret": BPX_SECRET_KEY,
     "enableRateLimit": True,
 })
+if BPX_PROXY:
+    ex.proxies = {"http": BPX_PROXY, "https": BPX_PROXY}
+    logger.info("已启用 HTTP 代理: %s", BPX_PROXY)
 logger.info("ccxt %s 已初始化 | %s", ccxt.__version__, "DRY-RUN" if DRY_RUN else "实盘")
-if not has_key:
-    logger.warning("未配置 API key，仅行情可用")
+
+# ★ v5.0: 实盘启动硬校验（缺 key / 缺 WEB_TOKEN 直接拒绝启动，不再假跑 dry-run）
+if not DRY_RUN and not has_key:
+    logger.error("实盘模式(BPX_LIVE=1)必须配置 BPX_PUBLIC_KEY/BPX_SECRET_KEY，拒绝启动")
+    sys.exit(1)
+if not DRY_RUN and not BPX_WEB_TOKEN:
+    logger.error("实盘模式(BPX_LIVE=1)必须配置 BPX_WEB_TOKEN（POST 接口认证），拒绝启动")
+    sys.exit(1)
+if DRY_RUN and not BPX_WEB_TOKEN:
+    BPX_WEB_TOKEN = secrets.token_urlsafe(16)
+    logger.info("DRY-RUN 未配置 BPX_WEB_TOKEN，已自动生成随机 token 并注入页面")
 
 # 预加载市场（精度/符号/过滤器）
 try:
@@ -92,15 +129,18 @@ except Exception as e:
 # =====================================================================
 # 全局状态
 # =====================================================================
-position_state: Dict[str, Any] = {}          # {symbol: {spot_qty, perp_qty, ...}}
 active_orders: Dict[str, List[dict]] = {}    # {base_coin: [order_info, ...]}
 operation_log: List[str] = []
 _trade_lock = threading.Lock()
 _inflight: set = set()
-_last_state: Dict[str, Any] = {}
-_state_lock = threading.Lock()
+_frozen: set = set()                         # ★ 订单状态未知被冻结的币种
+_exposed: set = set()                        # ★ 回滚失败的裸敞口币种（EXPOSED）
+_unknown_exposure = False                    # ★ 启动对账发现未知敞口
 _cache_lock = threading.Lock()
-_funding_rate_cache: Dict[str, tuple] = {}  # {sym: (apy, timestamp)} TTL 60s
+_funding_rate_cache: Dict[str, tuple] = {}   # {sym: (apy, timestamp)} TTL 60s
+_task_results: Dict[str, dict] = {}          # {task_id: {status, result}}
+_dry_seq = 0
+_dry_seq_lock = threading.Lock()
 
 
 def add_log(msg: str):
@@ -110,6 +150,182 @@ def add_log(msg: str):
     if len(operation_log) > 200:
         operation_log.pop(0)
     logger.info(msg)
+
+
+# =====================================================================
+# SQLite 轻量账本（v5.0 新增）
+#   账本只做两件事：记录订单生命周期 + 按"已确认成交增量"维护策略持仓。
+#   任何仓位变化只能由 fetch_order 确认的增量驱动，不能由订单状态推断。
+# =====================================================================
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    conn = _db_conn()
+    try:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          client_order_id TEXT UNIQUE,
+          order_id TEXT,
+          symbol TEXT NOT NULL,
+          market TEXT NOT NULL,
+          side TEXT NOT NULL,
+          intent TEXT NOT NULL,
+          requested_amount REAL NOT NULL,
+          price REAL,
+          status TEXT DEFAULT 'new',
+          last_confirmed_filled REAL DEFAULT 0,
+          reduce_only INTEGER DEFAULT 0,
+          created_at TEXT,
+          updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS fills (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id TEXT,
+          client_order_id TEXT,
+          symbol TEXT,
+          market TEXT,
+          side TEXT,
+          qty REAL NOT NULL,
+          price REAL,
+          ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS strategy_positions (
+          symbol TEXT PRIMARY KEY,
+          spot_qty REAL DEFAULT 0,
+          perp_qty REAL DEFAULT 0,
+          updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+          id TEXT PRIMARY KEY,
+          action TEXT,
+          symbol TEXT,
+          status TEXT,
+          result TEXT,
+          created_at TEXT,
+          updated_at TEXT
+        );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _gen_client_order_id(symbol: str, intent: str) -> str:
+    return f"arb-{symbol}-{intent}-{int(time.time() * 1000)}"
+
+
+def _record_order(symbol: str, market: str, side: str, intent: str,
+                  amount: float, price: float, client_order_id: str = None,
+                  reduce_only: bool = False) -> str:
+    """登记订单（下单前调用），返回 client_order_id"""
+    if not client_order_id:
+        client_order_id = _gen_client_order_id(symbol, intent)
+    now = datetime.now().isoformat()
+    conn = _db_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO orders (client_order_id, symbol, market, side, intent, "
+            "requested_amount, price, status, last_confirmed_filled, reduce_only, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,'new',0,?,?,?)",
+            (client_order_id, symbol, market, side, intent, amount, price,
+             1 if reduce_only else 0, now, now))
+        conn.commit()
+    finally:
+        conn.close()
+    return client_order_id
+
+
+def _bind_order_id(client_order_id: str, order_id: str):
+    """下单返回后回填交易所 order_id"""
+    conn = _db_conn()
+    try:
+        conn.execute("UPDATE orders SET order_id=?, status='open', updated_at=? WHERE client_order_id=?",
+                     (order_id, datetime.now().isoformat(), client_order_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_order_row(order_id_or_client_id: str) -> Optional[dict]:
+    """按 order_id 或 client_order_id 查订单行（两者任一均可定位）"""
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE client_order_id=? OR order_id=?",
+            (order_id_or_client_id, order_id_or_client_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _update_order_fill(symbol: str, market: str, side: str, order_id: str,
+                       client_order_id: str, confirmed_filled: float, status: str):
+    """★ 核心记账：按已确认增量更新账本与策略持仓。
+    delta = 本次确认累计成交量 - 上次已确认累计成交量，仅 delta>0 记账。"""
+    conn = _db_conn()
+    try:
+        row = conn.execute("SELECT last_confirmed_filled FROM orders WHERE client_order_id=?",
+                           (client_order_id,)).fetchone()
+        last = float(row["last_confirmed_filled"]) if row else 0.0
+        now = datetime.now().isoformat()
+        if status in ("open", "closed", "canceled"):
+            conn.execute(
+                "UPDATE orders SET status=?, order_id=COALESCE(?, order_id), "
+                "last_confirmed_filled=?, updated_at=? WHERE client_order_id=?",
+                (status, order_id, confirmed_filled, now, client_order_id))
+        delta = round(confirmed_filled - last, 12)
+        if delta > 1e-10:
+            conn.execute(
+                "INSERT INTO fills (order_id, client_order_id, symbol, market, side, qty, price, ts) "
+                "VALUES (?,?,?,?,?,?,0,?)",
+                (order_id, client_order_id, symbol, market, side, delta, now))
+            # 持仓方向: spot buy + / sell - ; perp sell(开空) - / buy(平多) +
+            sign = 1.0 if side == "buy" else -1.0
+            pos = conn.execute("SELECT spot_qty, perp_qty FROM strategy_positions WHERE symbol=?",
+                               (symbol,)).fetchone()
+            s_q = float(pos["spot_qty"]) if pos else 0.0
+            p_q = float(pos["perp_qty"]) if pos else 0.0
+            if market == "spot":
+                s_q = round(s_q + delta * sign, 12)
+            else:
+                p_q = round(p_q + delta * sign, 12)
+            conn.execute(
+                "INSERT INTO strategy_positions (symbol, spot_qty, perp_qty, updated_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET spot_qty=excluded.spot_qty, "
+                "perp_qty=excluded.perp_qty, updated_at=excluded.updated_at",
+                (symbol, s_q, p_q, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_strategy_position(symbol: str) -> dict:
+    """读取账本策略持仓。perp_qty 为带符号基础资产量（空头为负）。"""
+    conn = _db_conn()
+    try:
+        row = conn.execute("SELECT spot_qty, perp_qty FROM strategy_positions WHERE symbol=?",
+                           (symbol,)).fetchone()
+        if row:
+            return {"spot_qty": float(row["spot_qty"]), "perp_qty": float(row["perp_qty"])}
+        return {"spot_qty": 0.0, "perp_qty": 0.0}
+    finally:
+        conn.close()
+
+
+def _all_strategy_positions() -> List[dict]:
+    conn = _db_conn()
+    try:
+        rows = conn.execute("SELECT symbol, spot_qty, perp_qty FROM strategy_positions "
+                            "WHERE ABS(spot_qty) > 1e-8 OR ABS(perp_qty) > 1e-8").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # =====================================================================
@@ -131,6 +347,20 @@ def _symbol_from_ccxt(ccxt_sym: str) -> str:
     return ccxt_sym.split("/")[0]
 
 
+def _market_of(ccxt_sym: str) -> str:
+    return "perp" if ":USDC" in ccxt_sym else "spot"
+
+
+def _contract_size(ccxt_sym: str) -> float:
+    """★ 从市场定义读取合约乘数，不默认 1 张 = 1 币"""
+    try:
+        m = markets.get(ccxt_sym) or {}
+        cs = m.get("contractSize") or 1
+        return float(cs)
+    except Exception:
+        return 1.0
+
+
 def _depth_bbo(ccxt_sym: str) -> tuple:
     """返回 (买一价, 卖一价)。ccxt 已自动归一 bids 为降序，bids[0]=买一"""
     try:
@@ -150,6 +380,18 @@ def _depth_mid(ccxt_sym: str) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _cross_price(ccxt_sym: str, side: str, max_slippage_bps: int = MAX_SLIPPAGE_BPS) -> Optional[float]:
+    """★ 可成交限价（带滑点上限）：买入用卖一×(1+滑点)，卖出用买一×(1-滑点）。
+    post_only=False 只代表允许吃单，限价本身必须穿过盘口才会成交。"""
+    bid, ask = _depth_bbo(ccxt_sym)
+    if not bid or not ask:
+        return None
+    slip = max_slippage_bps / 10_000.0
+    if side == "buy":
+        return ask * (1 + slip)
+    return bid * (1 - slip)
 
 
 def _get_collateral_data(exchange) -> dict:
@@ -187,30 +429,120 @@ def _get_haircut(symbol: str) -> float:
     return 0
 
 
-# =====================================================================
-# 下单 / 撤单 / 查单
-# =====================================================================
-
-def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
-                 price: float, post_only: bool = True) -> Optional[str]:
-    """下限价单。精度由 ccxt 的 amount_to_precision / price_to_precision 自动处理"""
-    action = f"{'maker' if post_only else 'taker'} {side} {ccxt_sym} {amount:.4f} @ {price}"
-    if DRY_RUN or not has_key:
-        add_log(f"[DRY] {action}")
-        return f"dry-{int(time.time() * 1000)}"
-
+def _funding_rate_info(ccxt_sym: str) -> Tuple[Optional[float], Optional[float]]:
+    """返回 (最新费率, 年化APY)。★ APY 按实际结算周期年化，不再硬编码每小时。"""
     try:
-        params = {}
-        if post_only:
-            params["postOnly"] = True
+        fr = ex.fetch_funding_rate(ccxt_sym)
+        rate = float(fr.get("fundingRate", 0) or 0)
+        interval = float(fr.get("fundingInterval") or markets.get(ccxt_sym, {}).get("fundingInterval")
+                         or FUNDING_INTERVAL_DEFAULT_S)
+        if interval <= 0:
+            interval = FUNDING_INTERVAL_DEFAULT_S
+        apy = rate * (86400.0 / interval) * 365.0 * 100.0
+        return rate, apy
+    except Exception:
+        return None, None
 
-        # 如果是现货，加 autoLend/autoBorrow/autoLendRedeem
-        # autoLendRedeem: 平仓卖现货时，若持仓在 lend 状态自动赎回再卖（否则 avail=0 会被拒）
-        if "/USDC" in ccxt_sym and ":USDC" not in ccxt_sym:
+
+def _get_spot_total(symbol: str) -> Optional[float]:
+    """账户该币种总持有量（含出借中，来自 collateral）"""
+    if not has_key or DRY_RUN:
+        return None
+    try:
+        col = _get_collateral_data(ex)
+        for ci in col.get("collateral", []) or []:
+            if ci.get("symbol") == symbol:
+                return float(ci.get("totalQuantity", 0) or 0)
+    except Exception:
+        pass
+    return None
+
+
+def _get_usdc_borrow() -> Optional[float]:
+    """读取 USDC 借款余额。取不到字段则返回 None（未知）。
+    ★ 平仓后必须验证债务归零，避免自以为平仓成功。"""
+    if not has_key or DRY_RUN:
+        return None
+    try:
+        col = _get_collateral_data(ex)
+        for ci in col.get("collateral", []) or []:
+            if ci.get("symbol") == "USDC":
+                for k in ("borrowQuantity", "borrowedQuantity", "borrow", "liabilityQuantity"):
+                    if k in ci:
+                        return float(ci[k] or 0)
+        return None
+    except Exception:
+        return None
+
+
+# =====================================================================
+# 下单 / 撤单 / 查单（v5.0 重写）
+# =====================================================================
+
+def _order_params(market: str, intent: str, side: str, reduce_only: bool = False) -> dict:
+    """★ 按交易意图生成交易所参数。
+    借贷规则：
+      - 开仓买入现货: 允许 autoBorrow 借 USDC；买到的币可自动出借
+      - 平仓卖出现货: 允许赎回出借的币(autoLendRedeem)；禁止 autoBorrow 借入标的币
+      - 永续平仓: 强制 reduceOnly，禁止反向开仓"""
+    params: dict = {}
+    if market == "spot":
+        if intent == "open" and side == "buy":
+            params["autoBorrow"] = True
+            params["autoLend"] = True
+        elif intent == "close" and side == "sell":
             params["autoLend"] = True
             params["autoLendRedeem"] = True
-            params["autoBorrow"] = True
+    else:
+        if reduce_only:
+            params["reduceOnly"] = True
+    return params
 
+
+def _rescue_unknown_placement(ccxt_sym: str, client_order_id: str) -> Optional[str]:
+    """★ 下单请求网络异常后，订单可能已被交易所接受。
+    用 client_id 扫描未成交订单找回，避免重复下单。"""
+    if client_order_id.startswith("dry-"):
+        return None
+    try:
+        for o in (ex.fetch_open_orders(ccxt_sym) or []):
+            if str(o.get("clientOrderId", "") or o.get("clientId", "") or "") == client_order_id:
+                return str(o["id"])
+    except Exception:
+        pass
+    return None
+
+
+def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
+                 price: float, intent: str = "open", post_only: bool = True,
+                 reduce_only: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    """下限价单。返回 (order_id, client_order_id)。失败返回 (None, None)。
+    精度由 ccxt 的 amount_to_precision / price_to_precision 自动处理"""
+    symbol = _symbol_from_ccxt(ccxt_sym)
+    market = _market_of(ccxt_sym)
+    action = f"{'maker' if post_only else 'taker'} {side} {ccxt_sym} {amount:.4f} @ {price}"
+    coid = _record_order(symbol, market, side, intent, amount, price, reduce_only=reduce_only)
+
+    if DRY_RUN or not has_key:
+        with _dry_seq_lock:
+            global _dry_seq
+            _dry_seq += 1
+            dry_id = f"dry-{int(time.time() * 1000)}-{_dry_seq}"
+        conn = _db_conn()
+        try:
+            conn.execute("UPDATE orders SET order_id=?, status='open', updated_at=? WHERE client_order_id=?",
+                         (dry_id, datetime.now().isoformat(), coid))
+            conn.commit()
+        finally:
+            conn.close()
+        add_log(f"[DRY] {action}")
+        return dry_id, coid
+
+    try:
+        params = _order_params(market, intent, side, reduce_only)
+        params["clientId"] = coid
+        if post_only:
+            params["postOnly"] = True
         order = exchange.create_order(
             symbol=ccxt_sym,
             type="limit",
@@ -221,68 +553,173 @@ def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
         )
         oid = order.get("id")
         if oid:
+            _bind_order_id(coid, str(oid))
             add_log(f"{action} → order_id={oid}")
-            return str(oid)
-        add_log(f"[FAIL] {action}: order={order}")
+            return str(oid), coid
+        add_log(f"[FAIL] {action}: 交易所未返回订单号 order={order}")
     except ccxt.InvalidOrder as e:
         add_log(f"[FAIL] InvalidOrder {action}: {str(e)[:120]}")
     except ccxt.InsufficientFunds as e:
         add_log(f"[FAIL] 余额不足 {action}: {str(e)[:120]}")
     except ccxt.NetworkError as e:
+        # ★ 网络异常时订单可能已被接受：尝试找回，找回失败提示人工核查
         add_log(f"[FAIL] 网络异常 {action}: {e}")
+        rescued = _rescue_unknown_placement(ccxt_sym, coid)
+        if rescued:
+            _bind_order_id(coid, rescued)
+            add_log(f"[恢复] 下单网络异常但已找回订单 {rescued}")
+            return rescued, coid
+        add_log(f"[警告] 下单请求状态未知，可能已被交易所接受，请人工核查 {coid}")
     except Exception as e:
         add_log(f"[FAIL] {action}: {type(e).__name__} {str(e)[:120]}")
-    return None
+    return None, coid
 
 
-def _cancel_order(exchange, ccxt_sym: str, order_id: str) -> bool:
+def _check_order_filled(exchange, ccxt_sym: str, order_id: str) -> Tuple[str, float, float]:
+    """★ 返回 (status, filled, avg_price)。
+    status ∈ {open, closed, canceled, unknown}。
+    绝不把 OrderNotFound 当成已成交 —— 状态未知就是未知（unknown）。"""
+    if order_id.startswith("dry-"):
+        row = _get_order_row(order_id)
+        return "closed", float(row["requested_amount"]) if row else 0.0, 0.0
+    if DRY_RUN or not has_key:
+        return "closed", 0.0, 0.0
+
+    def _read():
+        order = exchange.fetch_order(order_id, ccxt_sym)
+        status = order.get("status", "")
+        filled = float(order.get("filled", 0) or 0)
+        amount = float(order.get("amount", 0) or 0)
+        price = float(order.get("average", 0) or order.get("price", 0) or 0)
+        if status == "closed":
+            return "closed", filled, price
+        if status == "canceled":
+            return "canceled", filled, price
+        if status == "open" and amount > 0 and filled >= amount:
+            return "closed", filled, price
+        return "open", filled, price
+
+    try:
+        return _read()
+    except ccxt.OrderNotFound:
+        # 查不到：可能已成交归档/已撤销/节点不同步。短暂重试一次，仍未知则 UNKNOWN。
+        try:
+            time.sleep(1)
+            return _read()
+        except Exception:
+            add_log(f"[UNKNOWN] 订单 {order_id} 查询不到，状态未知（不假定成交，不重发同单）")
+            return "unknown", 0.0, 0.0
+    except ccxt.NetworkError as e:
+        # 网络抖动：视为仍挂单，下一轮继续查
+        add_log(f"[警告] 查单网络异常 {order_id}: {e}")
+        return "open", 0.0, 0.0
+    except Exception as e:
+        add_log(f"[警告] 查单异常 {order_id}: {type(e).__name__} {str(e)[:80]}")
+        return "open", 0.0, 0.0
+
+
+def _confirm_final_fill(ccxt_sym: str, order_id: str, client_order_id: str,
+                        symbol: str, market: str, side: str):
+    """★ 撤单后重新确认最终成交量，并以增量记账（撤单与成交竞态防护）"""
+    for _ in range(2):
+        status, filled, price = _check_order_filled(ex, ccxt_sym, order_id)
+        _update_order_fill(symbol, market, side, order_id, client_order_id, filled, status)
+        if status in ("closed", "canceled", "unknown"):
+            return status, filled
+        time.sleep(1)
+    return status, filled
+
+
+def _cancel_order(ccxt_sym: str, order_id: str, client_order_id: str,
+                  symbol: str, market: str, side: str) -> bool:
+    """撤单并重确认最终成交量。返回是否已撤（订单不再挂单）。"""
     if order_id.startswith("dry-"):
         add_log(f"[DRY] 撤单 {ccxt_sym} {order_id}")
-        return True
-    if DRY_RUN or not has_key:
+        _confirm_final_fill(ccxt_sym, order_id, client_order_id, symbol, market, side)
         return True
     try:
-        exchange.cancel_order(order_id, ccxt_sym)
+        ex.cancel_order(order_id, ccxt_sym)
         add_log(f"撤单 {ccxt_sym} {order_id}")
-        return True
     except ccxt.OrderNotFound:
-        add_log(f"撤单 {ccxt_sym} {order_id}: 订单已不存在（可能已成交）")
-        return True
+        add_log(f"撤单 {ccxt_sym} {order_id}: 订单已不存在（可能已成交），重新确认最终量")
     except Exception as e:
         add_log(f"[FAIL] 撤单 {ccxt_sym} {order_id}: {type(e).__name__} {str(e)[:120]}")
         return False
+    _confirm_final_fill(ccxt_sym, order_id, client_order_id, symbol, market, side)
+    return True
 
 
-def _check_order_filled(exchange, ccxt_sym: str, order_id: str) -> tuple:
-    """返回 (是否完全成交, 已成交量)。ccxt 会自动抛异常处理 4xx"""
-    if order_id.startswith("dry-"):
-        return True, ORDER_SIZE_USDC / 100
-    if DRY_RUN or not has_key:
-        return True, 1.0
-    try:
-        order = exchange.fetch_order(order_id, ccxt_sym)
-        status = order.get("status", "")
-        filled = float(order.get("filled", 0))
-        amount = float(order.get("amount", 0))
+# =====================================================================
+# 交易逻辑（v5.0 重写）
+# =====================================================================
+
+def _freeze(symbol: str, reason: str):
+    _frozen.add(symbol)
+    add_log(f"⛔ [{symbol}] 已冻结: {reason}（需人工核查，重启或人工处理后恢复）")
+
+
+def _mark_exposed(symbol: str, reason: str):
+    _exposed.add(symbol)
+    add_log(f"⚠ EXPOSED [{symbol}]: {reason} 存在单边敞口，请尽快人工处理！")
+
+
+def _spot_done(symbol: str, before: float) -> float:
+    """本次开仓对已确认的现货买入量（账本增量驱动）"""
+    now = _get_strategy_position(symbol)
+    return max(0.0, now["spot_qty"] - before)
+
+
+def _perp_done(symbol: str, before: float) -> float:
+    """本次开仓对已确认的永续开空量（账本增量驱动，空头方向）"""
+    now = _get_strategy_position(symbol)
+    return max(0.0, before - now["perp_qty"])
+
+
+def _rollback_open_leg(symbol: str, market: str, qty: float) -> bool:
+    """★ 开仓失败回滚已成交腿：现货→卖出；永续→买入平仓(reduceOnly)。
+    全部走滑点上限内的可成交限价。失败标记 EXPOSED。"""
+    if qty <= 1e-8:
+        return True
+    ccxt_sym = _ccxt_spot(symbol) if market == "spot" else _ccxt_perp(symbol)
+    side = "sell" if market == "spot" else "buy"
+    px = _cross_price(ccxt_sym, side)
+    if px is None:
+        _mark_exposed(symbol, f"回滚{market}腿无盘口")
+        return False
+    add_log(f"  ⚠ [{symbol}] 回滚{market}腿 {qty:.4f} @ {px:.6f}")
+    oid, coid = _place_limit(ex, ccxt_sym, side, qty, px, intent="close",
+                             post_only=False, reduce_only=(market == "perp"))
+    if not oid:
+        _mark_exposed(symbol, f"回滚{market}腿下单失败")
+        return False
+    t0 = time.time()
+    while time.time() - t0 < HEDGE_TIMEOUT_S:
+        time.sleep(1)
+        status, filled, _ = _check_order_filled(ex, ccxt_sym, oid)
+        _update_order_fill(symbol, market, side, oid, coid, filled, status)
         if status == "closed":
-            return True, filled
-        if status == "canceled":
-            return False, filled
-        return (filled >= amount and amount > 0, filled)
-    except ccxt.OrderNotFound:
-        # 查不到 = 可能已成交 + 已从挂单列表移除
-        return True, 1.0
-    except Exception:
-        return False, 0
+            add_log(f"  [{symbol}] 回滚{market}腿完成 ✓")
+            return True
+        if status == "unknown":
+            _freeze(symbol, "回滚订单状态未知")
+            _mark_exposed(symbol, f"回滚{market}腿状态未知")
+            return False
+    _cancel_order(ccxt_sym, oid, coid, symbol, market, side)
+    row = _get_order_row(coid)
+    rolled = float(row["last_confirmed_filled"]) if row else 0.0
+    remaining = max(0.0, qty - rolled)
+    _mark_exposed(symbol, f"回滚{market}腿未成交(剩{remaining:.4f})")
+    return False
 
 
-# =====================================================================
-# 交易逻辑 — 沿用原有策略
-# =====================================================================
-
-def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S):
-    """执行一对：现货买 + 合约卖。返回 (success, spot_total_filled, perp_total_filled)
-    即使部分成交也如实报告，不再丢弃已成交的腿。"""
+def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S) -> Tuple[bool, float, float, str]:
+    """★ 执行一对：现货买 + 合约卖（开仓）。
+    返回 (是否成功, spot_filled, perp_filled, 说明)。
+    关键修复：
+      - 任一腿有成交即立即追单（不等整腿成交，杜绝长时间裸露）
+      - 追单价格可成交（买一/卖一对侧 + 滑点上限）
+      - 追单超时回滚已成交腿
+      - 全部记账由账本"已确认增量"驱动"""
     spot_sym = _ccxt_spot(symbol)
     perp_sym = _ccxt_perp(symbol)
 
@@ -290,142 +727,192 @@ def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S):
     perp_bid, perp_ask = _depth_bbo(perp_sym)
     if not spot_bid or not spot_ask or not perp_bid or not perp_ask:
         add_log(f"[跳] {symbol} 无盘口数据")
-        return False, 0.0, 0.0
-
-    spot_total = 0.0
-    perp_total = 0.0
+        return False, 0.0, 0.0, "无盘口数据"
 
     for attempt in range(1, MAX_RETRIES + 1):
-        spot_amount = qty - spot_total
-        perp_amount = qty - perp_total
-        add_log(f"  [{symbol}] 第{attempt}次: 现货买@{spot_bid:.6f}({spot_amount:.4f}个) 合约卖@{perp_ask:.6f}({perp_amount:.4f}个)")
+        before = _get_strategy_position(symbol)
+        spot_before = before["spot_qty"]
+        perp_before = before["perp_qty"]
+        s_done = _spot_done(symbol, spot_before)
+        p_done = _perp_done(symbol, perp_before)
+        spot_amount = qty - s_done
+        perp_amount = qty - p_done
+        add_log(f"  [{symbol}] 第{attempt}次: 现货买@{spot_bid:.6f}({spot_amount:.4f}个) "
+                f"合约卖@{perp_ask:.6f}({perp_amount:.4f}个)")
 
-        # 只对有剩余的腿下单
-        spot_oid = None
-        perp_oid = None
+        spot_oid = perp_oid = None
+        spot_coid = perp_coid = None
         if spot_amount > 1e-8:
-            spot_oid = _place_limit(ex, spot_sym, "buy", spot_amount, spot_bid, post_only=True)
+            spot_oid, spot_coid = _place_limit(ex, spot_sym, "buy", spot_amount, spot_bid, intent="open", post_only=True)
         if perp_amount > 1e-8:
-            perp_oid = _place_limit(ex, perp_sym, "sell", perp_amount, perp_ask, post_only=True)
+            perp_oid, perp_coid = _place_limit(ex, perp_sym, "sell", perp_amount, perp_ask, intent="open", post_only=True)
 
+        # 任一腿下单失败：撤另一腿（带重确认），如实返回已确认量
         if (spot_amount > 1e-8 and not spot_oid) or (perp_amount > 1e-8 and not perp_oid):
             if spot_oid:
-                _cancel_order(ex, spot_sym, spot_oid)
+                _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "buy")
             if perp_oid:
-                _cancel_order(ex, perp_sym, perp_oid)
-            return False, spot_total, perp_total
+                _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "sell")
+            return False, _spot_done(symbol, spot_before), _perp_done(symbol, perp_before), "下单失败"
         if not spot_oid and not perp_oid:
-            return True, spot_total, perp_total  # 两腿在上轮全已成交
+            return True, s_done, p_done, ""  # 两腿在上轮已全成
 
         start = time.time()
-        s_exec = 0.0
-        p_exec = 0.0
+        spot_chased = False
+        perp_chased = False
         while time.time() - start < timeout_s:
             time.sleep(2)
 
-            s_ok = not spot_oid  # 无订单视为已成
-            p_ok = not perp_oid
-            s_exec = 0.0
-            p_exec = 0.0
+            s_status = p_status = "open"
             if spot_oid:
-                s_ok, s_exec = _check_order_filled(ex, spot_sym, spot_oid)
+                s_status, s_filled, _ = _check_order_filled(ex, spot_sym, spot_oid)
+                _update_order_fill(symbol, "spot", "buy", spot_oid, spot_coid, s_filled, s_status)
             if perp_oid:
-                p_ok, p_exec = _check_order_filled(ex, perp_sym, perp_oid)
+                p_status, p_filled, _ = _check_order_filled(ex, perp_sym, perp_oid)
+                _update_order_fill(symbol, "perp", "sell", perp_oid, perp_coid, p_filled, p_status)
 
-            if s_ok and p_ok:
-                spot_total += spot_amount
-                perp_total += perp_amount
-                add_log(f"  [{symbol}] 两腿均成交 ✓ (累计 现{spot_total:.4f}/合{perp_total:.4f})")
-                return True, spot_total, perp_total
+            # 订单状态未知 → 冻结该币种，不再继续下单（人工处理）
+            if (spot_oid and s_status == "unknown") or (perp_oid and p_status == "unknown"):
+                _freeze(symbol, "订单状态未知")
+                return False, _spot_done(symbol, spot_before), _perp_done(symbol, perp_before), "订单状态未知，已冻结"
 
-            if s_ok and spot_amount > 1e-8:
-                # 现货腿全成，合约需追
-                spot_total += spot_amount
-                spot_amount = 0.0
-                remaining = max(0.0001, perp_amount - p_exec) if p_exec > 0 else perp_amount
-                add_log(f"  [{symbol}] 现货成交，合约改 taker (剩余{remaining:.4f})")
-                _cancel_order(ex, perp_sym, perp_oid)
-                _, new_perp_ask = _depth_bbo(perp_sym)
-                if new_perp_ask:
-                    perp_oid = _place_limit(ex, perp_sym, "sell", remaining, new_perp_ask, post_only=False)
-                    perp_amount = remaining
+            s_done = _spot_done(symbol, spot_before)
+            p_done = _perp_done(symbol, perp_before)
+            s_full = s_done >= qty - 1e-8
+            p_full = p_done >= qty - 1e-8
+            if s_full and p_full:
+                add_log(f"  [{symbol}] 两腿均成交 ✓ (累计 现{s_done:.4f}/合{p_done:.4f})")
+                return True, s_done, p_done, ""
+
+            # ★ 现货腿有成交、永续未满 → 立即追单卖永续（可成交价）
+            if s_done > 1e-8 and not p_full and not perp_chased:
+                perp_chased = True
+                if perp_oid:
+                    _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "sell")
+                    perp_oid = perp_coid = None
+                p_done = _perp_done(symbol, perp_before)
+                if p_done < qty - 1e-8:
+                    remaining = qty - p_done
+                    px = _cross_price(perp_sym, "sell")   # ★ 卖单用买一×(1-滑点)
+                    if px is None:
+                        _mark_exposed(symbol, "合约追单无盘口")
+                        return False, s_done, p_done, "合约追单无盘口"
+                    add_log(f"  [{symbol}] 现货成交，合约追单卖 {remaining:.4f} @ {px:.6f}")
+                    perp_oid, perp_coid = _place_limit(ex, perp_sym, "sell", remaining, px,
+                                                       intent="open", post_only=False)
                     if not perp_oid:
-                        perp_total += p_exec
-                        add_log(f"  ⚠ [{symbol}] 现货已成交但合约无法成交！裸多预警！(已累计 现{spot_total:.4f}/合{perp_total:.4f})")
-                        return False, spot_total, perp_total
-                else:
-                    perp_total += p_exec
-                    add_log(f"  ⚠ [{symbol}] 合约 taker 无盘口！裸多预警！")
-                    return False, spot_total, perp_total
+                        _rollback_open_leg(symbol, "spot", s_done)
+                        return False, s_done, p_done, "合约追单失败，已回滚现货"
+                    t0 = time.time()
+                    while time.time() - t0 < HEDGE_TIMEOUT_S:
+                        time.sleep(1)
+                        pt, pf, _ = _check_order_filled(ex, perp_sym, perp_oid)
+                        _update_order_fill(symbol, "perp", "sell", perp_oid, perp_coid, pf, pt)
+                        if pt == "unknown":
+                            _freeze(symbol, "追单订单状态未知")
+                            return False, _spot_done(symbol, spot_before), _perp_done(symbol, perp_before), "追单状态未知"
+                        if _perp_done(symbol, perp_before) >= qty - 1e-8:
+                            break
+                    p_done = _perp_done(symbol, perp_before)
+                    if p_done < qty - 1e-8:
+                        # ★ 追单超时 → 回滚已成交现货，不继续裸露
+                        add_log(f"  ⚠ [{symbol}] 合约追单 {HEDGE_TIMEOUT_S}s 未成交，回滚现货 {s_done:.4f}")
+                        _rollback_open_leg(symbol, "spot", s_done)
+                        return False, s_done, p_done, "合约追单未成交，已回滚现货"
 
-            elif p_ok and perp_amount > 1e-8:
-                perp_total += perp_amount
-                perp_amount = 0.0
-                remaining = max(0.0001, spot_amount - s_exec) if s_exec > 0 else spot_amount
-                add_log(f"  [{symbol}] 合约成交，现货改 taker (剩余{remaining:.4f})")
-                _cancel_order(ex, spot_sym, spot_oid)
-                new_spot_bid, _ = _depth_bbo(spot_sym)
-                if new_spot_bid:
-                    spot_oid = _place_limit(ex, spot_sym, "buy", remaining, new_spot_bid, post_only=False)
-                    spot_amount = remaining
+            # ★ 永续腿有成交、现货未满 → 立即追单买现货（可成交价）
+            elif p_done > 1e-8 and not s_full and not spot_chased:
+                spot_chased = True
+                if spot_oid:
+                    _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "buy")
+                    spot_oid = spot_coid = None
+                s_done = _spot_done(symbol, spot_before)
+                if s_done < qty - 1e-8:
+                    remaining = qty - s_done
+                    px = _cross_price(spot_sym, "buy")    # ★ 买单用卖一×(1+滑点)
+                    if px is None:
+                        _mark_exposed(symbol, "现货追单无盘口")
+                        return False, s_done, p_done, "现货追单无盘口"
+                    add_log(f"  [{symbol}] 合约成交，现货追单买 {remaining:.4f} @ {px:.6f}")
+                    spot_oid, spot_coid = _place_limit(ex, spot_sym, "buy", remaining, px,
+                                                       intent="open", post_only=False)
                     if not spot_oid:
-                        spot_total += s_exec
-                        add_log(f"  ⚠ [{symbol}] 合约已成交但现货无法成交！裸空预警！(已累计 现{spot_total:.4f}/合{perp_total:.4f})")
-                        return False, spot_total, perp_total
-                else:
-                    spot_total += s_exec
-                    add_log(f"  ⚠ [{symbol}] 现货 taker 无盘口！裸空预警！")
-                    return False, spot_total, perp_total
+                        _rollback_open_leg(symbol, "perp", p_done)
+                        return False, s_done, p_done, "现货追单失败，已回滚合约"
+                    t0 = time.time()
+                    while time.time() - t0 < HEDGE_TIMEOUT_S:
+                        time.sleep(1)
+                        st2, sf2, _ = _check_order_filled(ex, spot_sym, spot_oid)
+                        _update_order_fill(symbol, "spot", "buy", spot_oid, spot_coid, sf2, st2)
+                        if st2 == "unknown":
+                            _freeze(symbol, "追单订单状态未知")
+                            return False, _spot_done(symbol, spot_before), _perp_done(symbol, perp_before), "追单状态未知"
+                        if _spot_done(symbol, spot_before) >= qty - 1e-8:
+                            break
+                    s_done = _spot_done(symbol, spot_before)
+                    if s_done < qty - 1e-8:
+                        add_log(f"  ⚠ [{symbol}] 现货追单 {HEDGE_TIMEOUT_S}s 未成交，回滚合约 {p_done:.4f}")
+                        _rollback_open_leg(symbol, "perp", p_done)
+                        return False, s_done, p_done, "现货追单未成交，已回滚合约"
 
-        # 超时，记录本次成交，撤单重试
-        if spot_amount > 1e-8:
-            spot_total += s_exec
-            _cancel_order(ex, spot_sym, spot_oid)
-        if perp_amount > 1e-8:
-            perp_total += p_exec
-            _cancel_order(ex, perp_sym, perp_oid)
-        add_log(f"  [{symbol}] 超时，撤单重挂 (已累计 现{spot_total:.4f}/合{perp_total:.4f})")
+        # 超时：撤两腿（带重确认），记录本次成交，重挂
+        if spot_oid:
+            _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "buy")
+        if perp_oid:
+            _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "sell")
+        s_done = _spot_done(symbol, spot_before)
+        p_done = _perp_done(symbol, perp_before)
+        add_log(f"  [{symbol}] 第{attempt}次超时，撤单重挂 (累计 现{s_done:.4f}/合{p_done:.4f})")
         time.sleep(2)
         spot_bid, spot_ask = _depth_bbo(spot_sym)
         perp_bid, perp_ask = _depth_bbo(perp_sym)
         if not spot_bid or not spot_ask or not perp_bid or not perp_ask:
-            return False, spot_total, perp_total
+            return False, s_done, p_done, "无盘口数据"
 
-    add_log(f"  [{symbol}] {MAX_RETRIES}次重试均失败 (累计 现{spot_total:.4f}/合{perp_total:.4f})")
-    return False, spot_total, perp_total
+    add_log(f"  [{symbol}] {MAX_RETRIES}次重试均失败 (累计 现{s_done:.4f}/合{p_done:.4f})")
+    return False, s_done, p_done, "重试次数用尽"
 
 
 def _get_real_position(symbol: str):
-    """从 API 读取真实持仓（现货 + 合约 + mark price），不依赖 position_state 记账。
-    返回 (spot_qty, perp_qty, perp_mark_price)。"""
+    """★ 从 API 读取真实持仓（现货 + 合约 + mark price）。
+    返回 (spot_qty, perp_qty_signed, perp_mark_price)。
+    perp_qty_signed 为带符号基础资产量：空头为负，多头为正。
+    方向识别：优先 ccxt 的 contracts 符号，再用 side 字段兜底修正。"""
     spot_qty = 0.0
     perp_qty = 0.0
     perp_mark = 0.0
     if has_key and not DRY_RUN:
-        # 合约量 + mark price（一次 fetch_positions 拿齐）
         try:
             ps = ex.fetch_positions() or []
             for p in ps:
                 if p["symbol"].split("/")[0] == symbol:
-                    perp_qty = abs(float(p.get("contracts", 0)))
-                    perp_mark = float(p.get("markPrice", 0) or p.get("entryPrice", 0))
+                    contracts = float(p.get("contracts", 0) or 0)
+                    cs = _contract_size(p["symbol"])
+                    perp_qty = contracts * cs
+                    side = p.get("side")
+                    if side == "short" and perp_qty > 0:
+                        perp_qty = -perp_qty
+                    elif side == "long" and perp_qty < 0:
+                        perp_qty = -perp_qty
+                    perp_mark = float(p.get("markPrice", 0) or p.get("entryPrice", 0) or 0)
                     break
         except Exception:
             pass
-        # 现货量（collateral 的 totalQuantity）
         try:
             col = _get_collateral_data(ex)
             for ci in col.get("collateral", []) or []:
                 if ci.get("symbol") == symbol:
-                    spot_qty = float(ci.get("totalQuantity", 0))
+                    spot_qty = float(ci.get("totalQuantity", 0) or 0)
                     break
         except Exception:
             pass
     return round(spot_qty, 8), round(perp_qty, 8), round(perp_mark, 8)
 
 
-def close_pair(symbol: str, spot_qty: float, perp_qty: float) -> tuple:
-    """平仓一对：现货卖 + 合约买入平仓。两腿各自独立 taker 直出，量可不等。
+def close_pair(symbol: str, spot_qty: float, perp_qty: float) -> Tuple[bool, float, float]:
+    """★ 平仓一对：现货卖 + 合约买入平仓。
+    现货卖出：可成交价（买一×(1-滑点)），intent=close 禁止借入标的币
+    合约买入：可成交价（卖一×(1+滑点)）+ reduceOnly 防反向开仓
     返回 (是否完全成交, spot_filled, perp_filled)"""
     spot_sym = _ccxt_spot(symbol)
     perp_sym = _ccxt_perp(symbol)
@@ -433,143 +920,207 @@ def close_pair(symbol: str, spot_qty: float, perp_qty: float) -> tuple:
     has_spot = spot_qty > 1e-8
     has_perp = perp_qty > 1e-8
 
-    spot_oid, perp_oid = None, None
+    spot_oid = perp_oid = None
+    spot_coid = perp_coid = None
     if has_spot:
-        _, spot_ask = _depth_bbo(spot_sym)
-        if spot_ask:
-            spot_oid = _place_limit(ex, spot_sym, "sell", spot_qty, spot_ask, post_only=False)
+        px = _cross_price(spot_sym, "sell")
+        if px is None:
+            add_log(f"  [{symbol}] 现货平仓无盘口")
+            return False, 0.0, 0.0
+        spot_oid, spot_coid = _place_limit(ex, spot_sym, "sell", spot_qty, px, intent="close", post_only=False)
     if has_perp:
-        perp_bid, _ = _depth_bbo(perp_sym)
-        if perp_bid:
-            perp_oid = _place_limit(ex, perp_sym, "buy", perp_qty, perp_bid, post_only=False)
+        px = _cross_price(perp_sym, "buy")
+        if px is None:
+            if spot_oid:
+                _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "sell")
+            add_log(f"  [{symbol}] 合约平仓无盘口")
+            return False, 0.0, 0.0
+        perp_oid, perp_coid = _place_limit(ex, perp_sym, "buy", perp_qty, px,
+                                           intent="close", post_only=False, reduce_only=True)
 
     if has_spot and not spot_oid:
         if perp_oid:
-            _cancel_order(ex, perp_sym, perp_oid)
+            _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "buy")
         add_log(f"  [{symbol}] 现货平仓下单失败")
         return False, 0.0, 0.0
     if has_perp and not perp_oid:
         if spot_oid:
-            _cancel_order(ex, spot_sym, spot_oid)
+            _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "sell")
         add_log(f"  [{symbol}] 合约平仓下单失败")
         return False, 0.0, 0.0
 
-    # 如果没有需要平仓的腿（理论上调用方会先检查，这里兜底）
     if not spot_oid and not perp_oid:
         return True, 0.0, 0.0
 
-    # 等待各腿成交，互相独立
-    s_done, s_executed = not has_spot, spot_qty if not has_spot else 0.0
-    p_done, p_executed = not has_perp, perp_qty if not has_perp else 0.0
+    s_done = not has_spot
+    p_done = not has_perp
+    s_exec = 0.0
+    p_exec = 0.0
+    s_replaced = p_replaced = False
     for _ in range(30):
         time.sleep(3)
         if spot_oid and not s_done:
-            s_ok, s_filled = _check_order_filled(ex, spot_sym, spot_oid)
-            s_executed = s_filled
-            if s_ok:
+            st, sf, _ = _check_order_filled(ex, spot_sym, spot_oid)
+            _update_order_fill(symbol, "spot", "sell", spot_oid, spot_coid, sf, st)
+            s_exec = sf
+            if st == "closed":
                 s_done = True
+            elif st == "unknown":
+                _freeze(symbol, "平仓订单状态未知")
+                add_log(f"  ⚠ [{symbol}] 现货平仓订单状态未知，已冻结")
+                return False, s_exec, p_exec
+            elif st == "canceled" and not s_replaced and spot_qty - sf > 1e-8:
+                # 被外部撤销且还有剩余 → 补一次可成交平仓单
+                s_replaced = True
+                remaining = spot_qty - sf
+                px = _cross_price(spot_sym, "sell")
+                if px:
+                    add_log(f"  [{symbol}] 现货平仓单被撤，补单卖 {remaining:.4f}")
+                    spot_oid, spot_coid = _place_limit(ex, spot_sym, "sell", remaining, px,
+                                                       intent="close", post_only=False)
+                    if not spot_oid:
+                        return False, s_exec, p_exec
         if perp_oid and not p_done:
-            p_ok, p_filled = _check_order_filled(ex, perp_sym, perp_oid)
-            p_executed = p_filled
-            if p_ok:
+            pt, pf, _ = _check_order_filled(ex, perp_sym, perp_oid)
+            _update_order_fill(symbol, "perp", "buy", perp_oid, perp_coid, pf, pt)
+            p_exec = pf
+            if pt == "closed":
                 p_done = True
+            elif pt == "unknown":
+                _freeze(symbol, "平仓订单状态未知")
+                add_log(f"  ⚠ [{symbol}] 合约平仓订单状态未知，已冻结")
+                return False, s_exec, p_exec
+            elif pt == "canceled" and not p_replaced and perp_qty - pf > 1e-8:
+                p_replaced = True
+                remaining = perp_qty - pf
+                px = _cross_price(perp_sym, "buy")
+                if px:
+                    add_log(f"  [{symbol}] 合约平仓单被撤，补单买 {remaining:.4f}")
+                    perp_oid, perp_coid = _place_limit(ex, perp_sym, "buy", remaining, px,
+                                                       intent="close", post_only=False, reduce_only=True)
+                    if not perp_oid:
+                        return False, s_exec, p_exec
         if s_done and p_done:
-            add_log(f"  [{symbol}] 平仓完成 ✓ (现货{s_executed:.4f}/合约{p_executed:.4f})")
-            return True, s_executed, p_executed
-        if s_done and has_perp:
-            add_log(f"  [{symbol}] 现货已卖出，等待合约平仓...")
-        if p_done and has_spot:
-            add_log(f"  [{symbol}] 合约已平仓，等待现货卖出...")
+            add_log(f"  [{symbol}] 平仓完成 ✓ (现货{s_exec:.4f}/合约{p_exec:.4f})")
+            return True, s_exec, p_exec
 
     # 超时后撤掉剩余
     if spot_oid and not s_done:
-        _cancel_order(ex, spot_sym, spot_oid)
+        _cancel_order(spot_sym, spot_oid, spot_coid, symbol, "spot", "sell")
     if perp_oid and not p_done:
-        _cancel_order(ex, perp_sym, perp_oid)
-    add_log(f"  ⚠ [{symbol}] 平仓超时，现货已成交{s_executed:.4f}/合约已成交{p_executed:.4f}")
-    return False, s_executed, p_executed
+        _cancel_order(perp_sym, perp_oid, perp_coid, symbol, "perp", "buy")
+    add_log(f"  ⚠ [{symbol}] 平仓超时，现货已成交{s_exec:.4f}/合约已成交{p_exec:.4f}")
+    return False, s_exec, p_exec
 
 
-def open_position(symbol: str, notional: float, leverage: float, order_size=None, timeout=None) -> dict:
-    """开仓"""
+def open_position(symbol: str, notional: float, leverage: float,
+                  order_size: Optional[float] = None, timeout: Optional[int] = None) -> dict:
+    """开仓。★ leverage 参与目标名义计算：target_notional = notional × leverage"""
     _order_size = order_size if order_size else ORDER_SIZE_USDC
     _timeout = timeout if timeout else PAIR_TIMEOUT_S
     spot_sym = _ccxt_spot(symbol)
+    perp_sym = _ccxt_perp(symbol)
+
+    if symbol in _frozen:
+        return {"ok": False, "error": f"{symbol} 已被冻结（订单状态未知），需人工处理后重启"}
+    if _unknown_exposure:
+        return {"ok": False, "error": "启动对账发现未知持仓，已禁止开仓，请先核对账本与交易所持仓"}
+
+    # ★ 费率硬门槛（三条件任一不满足 → 拒绝开仓）：
+    #   1. 费率为负或零（负费率开仓必然亏损）
+    #   2. 年化（按实际结算周期）低于 MIN_NET_APY 门槛
+    #   3. 净年化 = 年化 - EST_ROUND_TRIP_COST_APY 成本缓冲 ≤ 0（覆盖不了往返成本）
+    rate, apy = _funding_rate_info(perp_sym)
+    if rate is None:
+        if DRY_RUN:
+            add_log(f"[警告] {symbol} 无法获取资金费率（DRY-RUN 放行）")
+        else:
+            return {"ok": False, "error": "无法获取资金费率，拒绝开仓"}
+    if rate <= 0:
+        return {"ok": False, "error": f"费率不达标，拒绝开仓: 最新费率 {rate * 100:.4f}%（≤0，负费率开仓必然亏损）"}
+    net_apy = apy - EST_ROUND_TRIP_COST_APY
+    if apy < MIN_NET_APY:
+        return {"ok": False, "error": f"费率不达标，拒绝开仓: 年化 {apy:.1f}% < 门槛 {MIN_NET_APY}%"
+                                      f"（最新费率 {rate * 100:.4f}%）"}
+    if net_apy <= 0:
+        return {"ok": False, "error": f"费率不达标，拒绝开仓: 净年化 {net_apy:.1f}% ≤ 0"
+                                      f"（已扣成本缓冲 {EST_ROUND_TRIP_COST_APY}%）"}
 
     mid = _depth_mid(spot_sym)
     if not mid:
         return {"ok": False, "error": "无参考价"}
 
-    # 余额校验（用 netEquityAvailable）
+    leverage = max(1.0, float(leverage))
+    target_notional = notional * leverage   # ★ leverage 真正参与目标名义
+    add_log(f"开仓 {symbol}: 本金 {notional:.0f}U × {leverage:.1f}x = 目标名义 {target_notional:.0f}U")
+
+    # ★ 保证金校验（杠杆后口径）：所需保证金 = 目标名义 / 杠杆
     if has_key and not DRY_RUN:
         try:
             col = _get_collateral_data(ex)
-            avail = float(col.get("netEquityAvailable", 0))
-            if avail < notional:
-                return {"ok": False, "error": f"净值可用 {avail:.0f} < 开仓 {notional:.0f}"}
-        except Exception:
-            pass
+            avail = float(col.get("netEquityAvailable", 0) or 0)
+            need_margin = target_notional / leverage
+            if avail < need_margin:
+                return {"ok": False, "error": f"净值可用 {avail:.0f} < 所需保证金 {need_margin:.0f}"}
+        except Exception as e:
+            add_log(f"[警告] 余额校验失败: {e}")
 
-    # 杠杆校验
+    # 杠杆上限校验
     max_lev = _get_max_leverage(symbol)
     if max_lev > 0 and leverage > max_lev:
         return {"ok": False, "error": f"杠杆 {leverage}x > 上限 {max_lev}x"}
 
-    pairs = max(1, int(notional / _order_size))
-    pair_notional = notional / pairs
+    pairs = max(1, int(target_notional / _order_size))
+    pair_notional = target_notional / pairs
     pair_qty = pair_notional / mid   # ccxt 的 create_order 会自动量化
 
-    add_log(f"开仓 {symbol}: 名义 {notional:.0f}U {pairs}笔 每笔{pair_notional:.0f}U/{pair_qty:.4f}个")
-
     ok_pairs = 0
-    total_spot = 0.0
-    total_perp = 0.0
     for i in range(pairs):
         add_log(f"[{symbol}] 第 {i + 1}/{pairs} 对")
-        success, spot_filled, perp_filled = execute_pair(symbol, pair_qty, _timeout)
-        total_spot += spot_filled
-        total_perp += perp_filled
+        success, spot_filled, perp_filled, msg = execute_pair(symbol, pair_qty, _timeout)
         if success:
             ok_pairs += 1
+        if msg:
+            add_log(f"  [{symbol}] 说明: {msg}")
+        if spot_filled <= 1e-8 and perp_filled <= 1e-8 and not success:
+            break  # 首对零成交且失败，不必继续
         time.sleep(2)
 
-    # 部分成交也登记仓位，避免幽灵仓位
-    effective_qty = min(total_spot, total_perp)
-    if effective_qty > 0:
-        if symbol in position_state:
-            pos = position_state[symbol]
-            pos["qty"] += effective_qty
-            pos["notional"] += effective_qty * mid
-        else:
-            position_state[symbol] = {
-                "qty": effective_qty,
-                "notional": effective_qty * mid,
-                "entry_price": mid,
-                "entry_time": datetime.now().isoformat(),
-            }
-        if abs(total_spot - total_perp) > 1e-8:
-            add_log(f"  ⚠ [{symbol}] 裸敞口! 现货{total_spot:.4f}≠合约{total_perp:.4f} "
-                    f"已登记{effective_qty:.4f}对仓位，差额需去 Backpack 手动处理")
-    return {"ok": ok_pairs > 0 or effective_qty > 0, "pairs_done": ok_pairs, "pairs_total": pairs}
+    sp = _get_strategy_position(symbol)
+    add_log(f"开仓 {symbol} 结束: 成功 {ok_pairs}/{pairs} 对 | 账本 现{sp['spot_qty']:.4f}/合{sp['perp_qty']:.4f}")
+    return {"ok": ok_pairs > 0, "pairs_done": ok_pairs, "pairs_total": pairs,
+            "strategy_spot": sp["spot_qty"], "strategy_perp": sp["perp_qty"]}
 
 
-def close_position(symbol: str, order_size=None) -> dict:
-    """平仓 — 以 API 真实持仓为准，不依赖 position_state 记账"""
+def close_position(symbol: str, order_size: Optional[float] = None) -> dict:
+    """★ 平仓：只关闭账本记录的策略持仓，不动人工持仓。
+    量取 min(账本量, API 总持有量) 双保险；平仓后验证 USDC 债务归零。"""
     _order_size = order_size if order_size else ORDER_SIZE_USDC
 
-    spot_qty, perp_qty, perp_mark = _get_real_position(symbol)
-    if spot_qty <= 1e-8 and perp_qty <= 1e-8:
-        return {"ok": False, "error": f"{symbol} 无持仓（API 返回现货=0 合约=0）"}
+    sp = _get_strategy_position(symbol)
+    ledger_spot = sp["spot_qty"]
+    ledger_perp = sp["perp_qty"]          # 带符号，空头为负
 
-    # 合约 mark price（_get_real_position 已随 fetch_positions 一并取回，消除 N+1）
+    spot_qty = ledger_spot
+    spot_total = _get_spot_total(symbol)
+    if spot_total is not None:
+        spot_qty = min(ledger_spot, max(0.0, spot_total))  # 兜底防超卖
+    perp_short = abs(ledger_perp) if ledger_perp < 0 else 0.0
+
+    if spot_qty <= 1e-8 and perp_short <= 1e-8:
+        return {"ok": False, "error": f"{symbol} 无策略持仓（账本 现货=0 合约=0）"}
+
+    # 合约 mark price（_get_real_position 一并取回）
+    _, _, perp_mark = _get_real_position(symbol)
     perp_price = perp_mark if perp_mark > 0 else 1.0
 
-    perp_notional = perp_qty * perp_price
-    pairs = max(1, int(perp_notional / _order_size)) if perp_qty > 1e-8 else max(1, int(spot_qty * 100 / _order_size))
+    perp_notional = perp_short * perp_price
+    pairs = max(1, int(perp_notional / _order_size)) if perp_short > 1e-8 \
+        else max(1, int(spot_qty * 100 / _order_size))
     pair_spot = spot_qty / pairs
-    pair_perp = perp_qty / pairs
+    pair_perp = perp_short / pairs
 
-    add_log(f"平仓 {symbol}: API 现货{spot_qty:.4f} 合约{perp_qty:.4f} → {pairs}笔")
+    add_log(f"平仓 {symbol}: 账本 现货{spot_qty:.4f} 合约{perp_short:.4f} → {pairs}笔")
     total_spot_closed = 0.0
     total_perp_closed = 0.0
     ok_pairs = 0
@@ -581,21 +1132,79 @@ def close_position(symbol: str, order_size=None) -> dict:
             ok_pairs += 1
         time.sleep(2)
 
-    s_rem = spot_qty - total_spot_closed
-    p_rem = perp_qty - total_perp_closed
-    if s_rem <= 1e-8 and p_rem <= 1e-8:
-        position_state.pop(symbol, None)
-        add_log(f"平仓完成 {symbol} ✓")
+    sp2 = _get_strategy_position(symbol)
+    # ★ USDC 债务归零验证
+    debt = _get_usdc_borrow()
+    if debt is None:
+        debt_msg = "无法确认 USDC 债务状态，请人工核对"
+    elif debt > 1e-8:
+        debt_msg = f"USDC 债务未归零: {debt:.6f}，请人工检查"
     else:
-        add_log(f"平仓部分完成 {symbol}: 现货剩{s_rem:.4f} 合约剩{p_rem:.4f}")
-        # 仍有剩余，更新 position_state 备忘（分别记现货/合约剩余，不再只记配对最小量）
-        position_state[symbol] = {
-            "qty": min(s_rem, p_rem),
-            "spot_remaining": s_rem,
-            "perp_remaining": p_rem,
-            "entry_price": perp_price,
-        }
-    return {"ok": ok_pairs > 0, "pairs_done": ok_pairs, "pairs_total": pairs}
+        debt_msg = "USDC 债务已归零"
+
+    add_log(f"平仓 {symbol} 结束: 成功 {ok_pairs}/{pairs} 对 | 账本剩余 现{sp2['spot_qty']:.4f}/"
+            f"合{sp2['perp_qty']:.4f} | {debt_msg}")
+    return {"ok": ok_pairs > 0, "pairs_done": ok_pairs, "pairs_total": pairs,
+            "spot_remaining": sp2["spot_qty"], "perp_remaining": sp2["perp_qty"],
+            "debt": debt_msg}
+
+
+def _reconcile_positions():
+    """★ 启动对账：真实持仓 vs 账本。
+    发现未知持仓/未知订单 → _unknown_exposure=True，禁止开新仓。"""
+    global _unknown_exposure
+    if not has_key or DRY_RUN:
+        add_log("[对账] DRY-RUN/无 key，跳过")
+        return
+    perp_tradable = {s.split("/")[0] for s in perp_symbols}
+    issues = 0
+
+    try:
+        ps = ex.fetch_positions() or []
+        for p in ps:
+            base = p["symbol"].split("/")[0]
+            if base not in perp_tradable:
+                continue
+            contracts = float(p.get("contracts", 0) or 0)
+            cs = _contract_size(p["symbol"])
+            real_qty = contracts * cs
+            side = p.get("side")
+            if side == "short" and real_qty > 0:
+                real_qty = -real_qty
+            elif side == "long" and real_qty < 0:
+                real_qty = -real_qty
+            if abs(real_qty) <= 1e-8:
+                continue
+            lp = _get_strategy_position(base)
+            if abs(real_qty - lp["perp_qty"]) > 1e-6:
+                issues += 1
+                add_log(f"[对账] ⚠ {base} 合约: 真实 {real_qty:.6f} vs 账本 {lp['perp_qty']:.6f} → 未知敞口")
+    except Exception as e:
+        issues += 1
+        add_log(f"[对账] 无法读取合约持仓: {e}")
+
+    try:
+        col = _get_collateral_data(ex)
+        for ci in col.get("collateral", []) or []:
+            sym = ci.get("symbol", "")
+            if sym not in perp_tradable:
+                continue
+            real_qty = float(ci.get("totalQuantity", 0) or 0)
+            if abs(real_qty) <= 1e-8:
+                continue
+            lp = _get_strategy_position(sym)
+            if abs(real_qty - lp["spot_qty"]) > 1e-6:
+                issues += 1
+                add_log(f"[对账] ⚠ {sym} 现货: 真实 {real_qty:.6f} vs 账本 {lp['spot_qty']:.6f} → 未知敞口")
+    except Exception as e:
+        issues += 1
+        add_log(f"[对账] 无法读取现货持仓: {e}")
+
+    if issues:
+        _unknown_exposure = True
+        add_log(f"[对账] 发现 {issues} 处未知敞口，已禁止开仓（可用 /api/close 平掉账本持仓后人工核对）")
+    else:
+        add_log("[对账] 账本与真实持仓一致 ✓")
 
 
 # =====================================================================
@@ -624,32 +1233,37 @@ def _build_state() -> dict:
         try:
             collateral_data = _get_collateral_data(ex) or {}
             collateral_items = collateral_data.get("collateral", []) or []
-            total_assets_value = float(collateral_data.get("assetsValue", 0))
+            total_assets_value = float(collateral_data.get("assetsValue", 0) or 0)
             # marginFraction 是账户级实际维持保证金率（已经是百分比数值，如 2.043 表示 2.0%）
-            mf = float(collateral_data.get("marginFraction", 0))
+            mf = float(collateral_data.get("marginFraction", 0) or 0)
             maintenance_margin = round(mf, 1) if mf > 0 else None
         except Exception:
             collateral_data = {}
             collateral_items = []
 
-    # 构建持仓视图
+    # 构建持仓视图（★ perp_qty 带符号 + 方向字段）
     for pp in perp_positions:
         sym = pp["symbol"].split("/")[0]
         if not sym:
             continue
-        perp_notional = abs(float(pp.get("notional", 0)))
-        perp_entry = float(pp.get("entryPrice", 0))
+        contracts = float(pp.get("contracts", 0) or 0)
+        cs = _contract_size(pp["symbol"])
+        perp_qty = contracts * cs
+        perp_side = pp.get("side") or ("long" if perp_qty >= 0 else "short")
+        if perp_side == "short" and perp_qty > 0:
+            perp_qty = -perp_qty
+        perp_notional = abs(float(pp.get("notional", 0) or 0))
+        perp_entry = float(pp.get("entryPrice", 0) or 0)
         perp_mark = float(pp.get("markPrice", 0) or 1)
-        perp_qty = abs(float(pp.get("contracts", 0)))
-        perp_pnl_unrealized = round(float(pp.get("unrealizedPnl", 0)), 4)
+        perp_pnl_unrealized = round(float(pp.get("unrealizedPnl", 0) or 0), 4)
 
         # 从现货抵押品中找匹配
         spot_qty = 0.0
         spot_mark = 0.0
         for ci in collateral_items:
             if ci.get("symbol") == sym:
-                spot_qty = float(ci.get("totalQuantity", 0))
-                spot_mark = float(ci.get("assetMarkPrice", 0))
+                spot_qty = float(ci.get("totalQuantity", 0) or 0)
+                spot_mark = float(ci.get("assetMarkPrice", 0) or 0)
                 break
 
         # 资金费率（带缓存 TTL 60s）
@@ -661,13 +1275,11 @@ def _build_state() -> dict:
             if cached and now_ts - cached[1] < 60:
                 funding_rate = cached[0]
         if funding_rate is None:
-            try:
-                fr = ex.fetch_funding_rate(cache_key)
-                funding_rate = round((fr.get("fundingRate", 0) or 0) * 24 * 365 * 100, 1)
+            _, apy = _funding_rate_info(cache_key)
+            if apy is not None:
+                funding_rate = round(apy, 1)
                 with _cache_lock:
                     _funding_rate_cache[cache_key] = (funding_rate, now_ts)
-            except Exception:
-                pass
 
         positions[sym] = {
             "symbol": sym,
@@ -676,6 +1288,7 @@ def _build_state() -> dict:
             "spot_price": spot_mark,
             "spot_value": round(spot_qty * spot_mark, 2) if spot_mark else None,
             "perp_qty": perp_qty,
+            "perp_side": perp_side,
             "perp_entry": perp_entry,
             "perp_mark": perp_mark,
             "perp_notional": perp_notional,
@@ -686,17 +1299,16 @@ def _build_state() -> dict:
         }
 
     # 扫描裸现货（有现货持仓但无合约持仓的币种，前端持仓表不可见 → 补上）
-    # 只扫描有永续交易对的币种（跳过 USDC 等结算币）
     perp_tradable = {s.split("/")[0] for s in perp_symbols}
     has_perp_syms = {pp["symbol"].split("/")[0] for pp in perp_positions}
     for ci in collateral_items:
         sym = ci.get("symbol", "")
-        spot_qty = float(ci.get("totalQuantity", 0))
+        spot_qty = float(ci.get("totalQuantity", 0) or 0)
         if spot_qty <= 1e-8 or sym in positions or sym in has_perp_syms:
             continue
         if sym not in perp_tradable:
             continue
-        spot_mark = float(ci.get("assetMarkPrice", 0))
+        spot_mark = float(ci.get("assetMarkPrice", 0) or 0)
         positions[sym] = {
             "symbol": sym,
             "spot_qty": spot_qty,
@@ -704,6 +1316,7 @@ def _build_state() -> dict:
             "spot_price": spot_mark,
             "spot_value": round(spot_qty * spot_mark, 2) if spot_mark else None,
             "perp_qty": 0,
+            "perp_side": None,
             "perp_entry": 0,
             "perp_mark": 0,
             "perp_notional": 0,
@@ -717,10 +1330,10 @@ def _build_state() -> dict:
     for ci in collateral_items:
         balances.append({
             "asset": ci.get("symbol", "?"),
-            "available": float(ci.get("availableQuantity", 0)),
-            "locked": float(ci.get("openOrderQuantity", 0)),
-            "lend": float(ci.get("lendQuantity", 0)),
-            "total_notional": float(ci.get("balanceNotional", 0)),
+            "available": float(ci.get("availableQuantity", 0) or 0),
+            "locked": float(ci.get("openOrderQuantity", 0) or 0),
+            "lend": float(ci.get("lendQuantity", 0) or 0),
+            "total_notional": float(ci.get("balanceNotional", 0) or 0),
         })
 
     # 活跃订单
@@ -735,8 +1348,8 @@ def _build_state() -> dict:
                 base = sym.split("/")[0]
                 o["market"] = "合约" if ":USDC" in sym else "现货"
                 o["sym"] = sym
-                o["qty"] = float(o.get("amount", 0))
-                o["executedQty"] = float(o.get("filled", 0))
+                o["qty"] = float(o.get("amount", 0) or 0)
+                o["executedQty"] = float(o.get("filled", 0) or 0)
                 o["price"] = float(o.get("price", 0) or 0)
                 o["side"] = o.get("side", "?")
                 if base not in active_orders:
@@ -776,17 +1389,40 @@ def _build_state() -> dict:
         "balances": balances,
         "maintenance_margin_ratio": maintenance_margin,
         "total_assets_value": total_assets_value,
+        "strategy_ledger": _all_strategy_positions(),
+        "unknown_exposure": _unknown_exposure,
+        "frozen": sorted(_frozen),
+        "exposed": sorted(_exposed),
         "logs": logs,
     }
 
 
 # =====================================================================
-# Flask API
+# Flask API（★ v5.0: 认证 + 任务模式 + 127.0.0.1）
 # =====================================================================
+
+def _check_auth() -> bool:
+    tok = request.headers.get("X-Auth-Token", "")
+    return bool(tok) and hmac.compare_digest(tok, BPX_WEB_TOKEN)
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _check_auth():
+            return jsonify({"ok": False, "error": "未授权"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _safe_error(e: Exception) -> str:
+    """★ 错误脱敏：不向前端返回原始交易所错误信息"""
+    return "交易接口异常，详见服务端日志"
+
 
 @app.route("/")
 def index():
-    return render_template("bpx_arb.html")
+    return render_template("bpx_arb.html", web_token=BPX_WEB_TOKEN)
 
 
 @app.route("/api/symbols")
@@ -813,16 +1449,13 @@ def api_symbols():
                 cached = _funding_rate_cache.get(cache_key)
                 if cached and now_ts - cached[1] < 60:
                     latest_apy = cached[0]
-                    latest_rate = latest_apy / (24 * 365 * 100) if latest_apy else None
             if latest_apy is None:
-                try:
-                    fr = ex.fetch_funding_rate(cache_key)
-                    latest_rate = fr.get("fundingRate", 0) or 0
-                    latest_apy = round(latest_rate * 24 * 365 * 100, 1)
+                rate, apy = _funding_rate_info(cache_key)
+                if rate is not None and apy is not None:
+                    latest_rate = rate
+                    latest_apy = round(apy, 1)
                     with _cache_lock:
                         _funding_rate_cache[cache_key] = (latest_apy, now_ts)
-                except Exception:
-                    pass
             result.append({
                 "symbol": sym,
                 "max_leverage": max_lev,
@@ -831,90 +1464,107 @@ def api_symbols():
                 "latest_apy": round(latest_apy, 1) if latest_apy else None,
             })
         return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return jsonify({"error": _safe_error(Exception("symbols"))}), 500
 
 
 @app.route("/api/state")
 def api_state():
     """返回当前状态"""
-    state = _build_state()
-    return jsonify(state)
+    return jsonify(_build_state())
+
+
+@app.route("/api/task/<task_id>")
+def api_task(task_id):
+    """查询后台任务结果（开仓/平仓的真实执行结果不再丢失）"""
+    t = _task_results.get(task_id)
+    if not t:
+        return jsonify({"ok": False, "error": "任务不存在"}), 404
+    return jsonify({"task_id": task_id, "status": t["status"], "result": t["result"]})
+
+
+def _task_submit(task_id: str, symbol: str, fn):
+    """启动后台任务并登记 _inflight"""
+    _task_results[task_id] = {"status": "running", "result": None}
+    with _trade_lock:
+        _inflight.add(symbol)
+
+    def _run():
+        try:
+            res = fn()
+            _task_results[task_id] = {"status": "done", "result": res}
+        except Exception as e:
+            add_log(f"[任务失败] {task_id}: {type(e).__name__} {str(e)[:120]}")
+            _task_results[task_id] = {"status": "error",
+                                      "result": {"ok": False, "error": _safe_error(e)}}
+        finally:
+            with _trade_lock:
+                _inflight.discard(symbol)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @app.route("/api/open", methods=["POST"])
+@require_auth
 def api_open():
-    """开仓"""
-    data = request.get_json()
-    symbol = data.get("symbol", "").strip()
-    notional = float(data.get("notional", 0))
-    leverage = float(data.get("leverage", 1))
-    order_size = float(data.get("order_size", ORDER_SIZE_USDC))
-    timeout = int(data.get("timeout", PAIR_TIMEOUT_S))
+    """开仓（任务模式：返回 task_id，结果由 /api/task 查询）"""
+    data = request.get_json(silent=True) or {}
+    symbol = str(data.get("symbol", "")).strip()
+    try:
+        notional = float(data.get("notional", 0) or 0)
+        leverage = float(data.get("leverage", 1) or 1)
+        order_size = float(data.get("order_size", 0) or 0)
+        timeout = int(data.get("timeout", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "参数无效"}), 400
 
     if not symbol or notional <= 0:
         return jsonify({"ok": False, "error": "币种或金额无效"}), 400
-
-    # 费率警告
-    try:
-        fr = ex.fetch_funding_rate(f"{symbol}/USDC:USDC")
-        current_rate = fr.get("fundingRate", 0) or 0
-        current_apy = current_rate * 24 * 365 * 100
-        if current_apy < MIN_WEEK_APY:
-            add_log(f"[警告] {symbol} 当前年化 {current_apy:.1f}% < {MIN_WEEK_APY}%")
-    except Exception:
-        pass
-
+    if symbol in _frozen:
+        return jsonify({"ok": False, "error": f"{symbol} 已被冻结，需人工处理"}), 409
+    if _unknown_exposure:
+        return jsonify({"ok": False, "error": "启动对账发现未知持仓，已禁止开仓"}), 409
     with _trade_lock:
         if symbol in _inflight:
             return jsonify({"ok": False, "error": f"{symbol} 有操作进行中"}), 409
-        _inflight.add(symbol)
 
-    def _run():
-        try:
-            open_position(symbol, notional, leverage, order_size, timeout)
-        finally:
-            with _trade_lock:
-                _inflight.discard(symbol)
-
-    threading.Thread(target=_run, daemon=True).start()
-    add_log(f"[提交] 开仓 {symbol} {notional:.0f}USDC → 后台执行")
-    return jsonify({"ok": True, "msg": "已提交后台执行"})
+    task_id = f"open-{int(time.time() * 1000)}"
+    add_log(f"[提交] 开仓 {symbol} {notional:.0f}U×{leverage:.1f}x → task {task_id}")
+    _task_submit(task_id, symbol, lambda: open_position(symbol, notional, leverage,
+                                                        order_size or None, timeout or None))
+    return jsonify({"ok": True, "task_id": task_id, "msg": "已提交后台执行"})
 
 
 @app.route("/api/close", methods=["POST"])
+@require_auth
 def api_close():
-    """平仓"""
-    data = request.get_json()
-    symbol = data.get("symbol", "").strip()
-    order_size = float(data.get("order_size", ORDER_SIZE_USDC))
+    """平仓（任务模式：返回 task_id）"""
+    data = request.get_json(silent=True) or {}
+    symbol = str(data.get("symbol", "")).strip()
+    try:
+        order_size = float(data.get("order_size", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "参数无效"}), 400
     if not symbol:
         return jsonify({"ok": False, "error": "币种无效"}), 400
-
     with _trade_lock:
         if symbol in _inflight:
             return jsonify({"ok": False, "error": f"{symbol} 有操作进行中"}), 409
-        _inflight.add(symbol)
 
-    def _run():
-        try:
-            close_position(symbol, order_size)
-        finally:
-            with _trade_lock:
-                _inflight.discard(symbol)
-
-    threading.Thread(target=_run, daemon=True).start()
-    add_log(f"[提交] 平仓 {symbol} → 后台执行")
-    return jsonify({"ok": True, "msg": "已提交后台执行"})
+    task_id = f"close-{int(time.time() * 1000)}"
+    add_log(f"[提交] 平仓 {symbol} → task {task_id}")
+    _task_submit(task_id, symbol, lambda: close_position(symbol, order_size or None))
+    return jsonify({"ok": True, "task_id": task_id, "msg": "已提交后台执行"})
 
 
 @app.route("/api/cancel", methods=["POST"])
+@require_auth
 def api_cancel():
     """撤单"""
-    data = request.get_json()
-    symbol = data.get("symbol", "").strip()
+    data = request.get_json(silent=True) or {}
+    symbol = str(data.get("symbol", "")).strip()
     if not symbol or not has_key:
-        return jsonify({"ok": False, "error": "无目标或无 key"})
+        return jsonify({"ok": False, "error": "无目标或无 key"}), 400
 
     try:
         spot_sym = _ccxt_spot(symbol)
@@ -925,8 +1575,8 @@ def api_cancel():
         perp_cnt = len(resp_perp) if isinstance(resp_perp, list) else 0
         add_log(f"手动撤单 {symbol}: 现货{spot_cnt}笔 合约{perp_cnt}笔")
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    except Exception:
+        return jsonify({"ok": False, "error": _safe_error(Exception("cancel"))})
 
 
 # =====================================================================
@@ -934,7 +1584,10 @@ def api_cancel():
 # =====================================================================
 
 if __name__ == "__main__":
-    logger.info("======== 启动 Backpack 套利面板 v4.0 (ccxt) 端口 %d ========", PORT)
-    logger.info("模式: %s | 单笔: %dU | 超时: %ds | 费率阈值: %d%%",
-                "DRY-RUN" if DRY_RUN else "实盘", ORDER_SIZE_USDC, PAIR_TIMEOUT_S, MIN_WEEK_APY)
-    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
+    _init_db()
+    _reconcile_positions()
+    logger.info("======== 启动 Backpack 套利面板 v5.0 (ccxt) 端口 %d ========", PORT)
+    logger.info("模式: %s | 单笔: %dU | 超时: %ds | 净年化门槛: %.1f%% | 滑点上限: %dbps",
+                "DRY-RUN" if DRY_RUN else "实盘", ORDER_SIZE_USDC, PAIR_TIMEOUT_S,
+                MIN_NET_APY, MAX_SLIPPAGE_BPS)
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)

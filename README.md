@@ -92,9 +92,18 @@ Edit `.env` with your Backpack API credentials:
 # .env — never commit this file!
 BPX_PUBLIC_KEY=your_public_key_here
 BPX_SECRET_KEY=your_secret_key_here
-BPX_LIVE=0    # 0 = dry-run, 1 = live trading
+BPX_LIVE=0       # 0 = dry-run, 1 = live trading
+# BPX_WEB_TOKEN=your_token  # 可选：POST 接口认证 token（实盘必须配置）
+# BPX_PROXY=http://127.0.0.1:10808  # 可选：命令行直连交易所被墙时，填本机代理（ccxt 需显式配置）
 ```
 
+> ⚠️ **Security / 安全（v5.0）**
+>
+> - 服务只监听 `127.0.0.1`，不再监听 0.0.0.0
+> - POST 交易接口需要 `X-Auth-Token` 请求头（`BPX_WEB_TOKEN`；DRY-RUN 未配置时自动生成并注入页面）
+> - `BPX_LIVE=1` 但缺少 API key 或 `BPX_WEB_TOKEN` 时直接拒绝启动
+> - 平仓只关闭策略自有持仓（SQLite 账本记录），不会触碰人工持仓
+>
 > ⚠️ **Security**: `.env` is in `.gitignore` — your credentials will never be committed.
 >
 > ⚠️ **安全**：`.env` 已在 `.gitignore` 中，凭证不会提交到 Git。
@@ -162,24 +171,31 @@ bpx_arb.html (Dashboard)
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Dashboard page |
-| GET | `/api/state` | Current positions, orders, balances, logs |
+| GET | `/api/state` | Current positions, orders, balances, logs, risk flags |
 | GET | `/api/symbols` | Eligible coins with funding rates |
-| POST | `/api/open` | Open a paired position (async) |
-| POST | `/api/close` | Close a position via API real holdings |
-| POST | `/api/cancel` | Cancel all open orders for a symbol |
+| GET | `/api/task/<id>` | Poll async open/close task result |
+| POST | `/api/open` | Open a paired position (async, requires auth) |
+| POST | `/api/close` | Close the strategy-owned position (async, requires auth) |
+| POST | `/api/cancel` | Cancel all open orders for a symbol (requires auth) |
 
 ---
 
 ## Risk Notes / 风险提示
 
-- **Funding rate can flip** — A positive funding rate today may be zero or negative tomorrow. Monitor regularly.
-- **Auto-lend is enabled** — Spot holdings are automatically lent for extra yield. `autoLendRedeem` ensures smooth closing.
-- **Partial fills** — If one leg only partially fills, the system tracks both spot and perpetual quantities independently. Closing uses real API holdings, so no orphan positions.
+- **Funding rate can flip** — A positive funding rate today may be zero or negative tomorrow. v5.0 hard-blocks opening when the annualized rate is below the threshold, the rate is zero/negative, or the net yield (after a cost buffer) is not positive.
+- **Auto-lend is enabled** — Spot holdings are automatically lent for extra yield. `autoLendRedeem` ensures smooth closing. Borrowing (`autoBorrow`) is only allowed on open-buy legs; closing spot sells can never borrow the base coin.
+- **Reduce-only closes** — Perpetual close orders carry `reduceOnly` so repeated/retried closes can never flip a short into a long.
+- **Order state machine** — `OrderNotFound` is treated as UNKNOWN (never assumed filled); unknown states freeze the symbol and require manual review.
+- **Strategy ledger** — A SQLite ledger (`arb_ledger.db`) records orders, confirmed fills and strategy-owned positions. Only confirmed fill increments move the ledger; closes only touch strategy-owned quantity; a startup reconciliation blocks new opens if unknown exposure is detected.
+- **Partial fills** — Any fill on one leg immediately triggers an aggressive chase on the other leg (marketable limit with slippage cap); if the chase fails, the filled leg is rolled back instead of staying exposed.
 - **Slippage** — Taker fallback during fast markets may result in worse prices than maker.
 
-- 资金费率随时可能逆转，持续关注
-- 现货自动借出赚息，平仓时自动赎回
-- 部分成交时两条腿各自追踪，平仓以 API 真实持仓为准
+- 资金费率随时可能逆转，持续关注；v5.0 费率为负、年化低于门槛或净年化≤0 将硬性拒绝开仓（门槛 MIN_NET_APY=10%，成本缓冲 EST_ROUND_TRIP_COST_APY=5%，可在 .env 同层常量调整）
+- 现货自动借出赚息，平仓时自动赎回；仅开仓买入允许借入 USDC，平仓卖单禁止借币
+- 永续平仓强制 reduceOnly，防止重复请求翻成反方向仓位
+- 订单查不到视为状态未知并冻结币种，绝不伪造成交
+- 账本记录订单/成交/策略持仓，重启可恢复；平仓只平策略自有持仓，不动人工持仓
+- 部分成交立即追单，追单失败回滚已成交腿，避免长时间裸敞口
 - 快速行情下 taker 兜底可能滑点，注意市场波动
 
 ---
