@@ -93,15 +93,17 @@ Edit `.env` with your Backpack API credentials:
 BPX_PUBLIC_KEY=your_public_key_here
 BPX_SECRET_KEY=your_secret_key_here
 BPX_LIVE=0       # 0 = dry-run, 1 = live trading
-# BPX_WEB_TOKEN=your_token  # 可选：POST 接口认证 token（实盘必须配置）
+BPX_WEB_USER=admin                 # 网页登录用户名（实盘必须配置）
+BPX_WEB_PASSWORD=your_password     # 网页登录密码（实盘必须配置）
 # BPX_PROXY=http://127.0.0.1:10808  # 可选：命令行直连交易所被墙时，填本机代理（ccxt 需显式配置）
 ```
 
-> ⚠️ **Security / 安全（v5.0）**
+> ⚠️ **Security / 安全（v5.1）**
 >
-> - 服务只监听 `127.0.0.1`，不再监听 0.0.0.0
-> - POST 交易接口需要 `X-Auth-Token` 请求头（`BPX_WEB_TOKEN`；DRY-RUN 未配置时自动生成并注入页面）
-> - `BPX_LIVE=1` 但缺少 API key 或 `BPX_WEB_TOKEN` 时直接拒绝启动
+> - 整个面板需要**用户名/密码登录**（`BPX_WEB_USER` / `BPX_WEB_PASSWORD`），未登录无法查看持仓或操作
+> - 登录会话为 HttpOnly cookie；登录接口带防爆破（5 次失败锁定 60 秒）
+> - 服务只监听 `127.0.0.1`，公网访问请用带 HTTPS 的反向代理（Caddy/Nginx）
+> - `BPX_LIVE=1` 但缺少 API key 或登录凭据时直接拒绝启动
 > - 平仓只关闭策略自有持仓（SQLite 账本记录），不会触碰人工持仓
 >
 > ⚠️ **Security**: `.env` is in `.gitignore` — your credentials will never be committed.

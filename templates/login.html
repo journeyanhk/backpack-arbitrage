@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>登录 - Backpack 资金费率套利 v{{ version }}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Microsoft YaHei', sans-serif; background: #f7f8fa; color: #333; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-box { width: 340px; background: #fff; border-radius: 8px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+  h1 { font-size: 18px; color: #444; margin-bottom: 4px; }
+  .sub { font-size: 12px; color: #999; margin-bottom: 20px; }
+  label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+  input { width: 100%; padding: 9px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; margin-bottom: 14px; }
+  input:focus { border-color: #3498db; outline: none; }
+  button { width: 100%; padding: 10px 0; border: none; border-radius: 4px; background: #3498db; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #2980b9; }
+  .err { color: #e74c3c; font-size: 12px; margin-bottom: 12px; min-height: 16px; }
+  .ver { text-align: center; font-size: 11px; color: #bbb; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>Backpack 资金费率套利</h1>
+  <div class="sub">请输入登录凭据（配置于 .env 的 BPX_WEB_USER / BPX_WEB_PASSWORD）</div>
+  <div class="err" id="err"></div>
+  <form id="login-form" autocomplete="on">
+    <label>用户名</label>
+    <input type="text" id="username" autocomplete="username" required>
+    <label>密码</label>
+    <input type="password" id="password" autocomplete="current-password" required>
+    <button type="submit">登 录</button>
+  </form>
+  <div class="ver">v{{ version }}</div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: document.getElementById('username').value,
+                             password: document.getElementById('password').value }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      window.location.href = '/';
+    } else {
+      err.textContent = d.error || '登录失败';
+    }
+  } catch (e2) { err.textContent = '网络错误'; }
+});
+</script>
+</body>
+</html>

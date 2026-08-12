@@ -25,8 +25,8 @@
 ---
 
 ## 风控与安全
-- **默认 DRY-RUN**（BPX_LIVE != 1）；实盘启动硬校验缺 key/缺 BPX_WEB_TOKEN 拒绝启动
-- **监听地址:** 仅 127.0.0.1；POST 接口需 X-Auth-Token
+- **默认 DRY-RUN**（BPX_LIVE != 1）；实盘启动硬校验缺 key/缺登录凭据拒绝启动
+- **监听地址:** 仅 127.0.0.1；整个面板需登录（BPX_WEB_USER/BPX_WEB_PASSWORD）
 - **借贷:** autoBorrow 仅开仓买入现货；平仓卖现货禁止借入标的币
 - **永续平仓:** 强制 reduceOnly
 - **费率:** 开仓硬门槛（净年化 ≥ MIN_NET_APY），费率为负拒绝开仓

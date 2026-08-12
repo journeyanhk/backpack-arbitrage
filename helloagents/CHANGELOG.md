@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-08-12
+
+### 新增
+- 网页登录保护（BPX_WEB_USER / BPX_WEB_PASSWORD，Flask session + HttpOnly cookie）：
+  未登录无法查看任何数据或操作；登录接口 5 次失败锁定 60 秒防爆破；实盘缺凭据拒绝启动
+- 页面与 /api/state 展示当前版本号（v5.1.0）
+- 登录页 /api/login、退出 /api/logout
+
+### 变更
+- 移除旧 X-Auth-Token 方案（token 注入页面源码，公网任何人可读取，形同虚设）
+
 ## [5.0.4] - 2026-08-12
 
 ### 修复

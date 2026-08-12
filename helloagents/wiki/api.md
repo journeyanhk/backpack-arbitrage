@@ -4,9 +4,10 @@
 本地 Flask 服务（端口 5055，仅监听 127.0.0.1）。交易类 POST 接口需要认证。
 
 ## 认证方式
-- 请求头 `X-Auth-Token`（值 = `BPX_WEB_TOKEN` 环境变量；DRY-RUN 未配置时自动生成并注入页面 JS）
-- 未认证的 POST 请求返回 401
-- 实盘（BPX_LIVE=1）未配置 token 直接拒绝启动
+- 整个面板（页面 + 全部 API）需要登录：`POST /api/login` 提交 BPX_WEB_USER / BPX_WEB_PASSWORD
+- 登录成功写入 HttpOnly session cookie，浏览器自动携带；未登录访问 API 返回 401，访问页面重定向到 /login
+- 登录接口防爆破：同 IP 60 秒内失败 5 次锁定
+- 实盘（BPX_LIVE=1）未配置登录凭据直接拒绝启动
 
 ---
 

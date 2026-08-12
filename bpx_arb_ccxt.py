@@ -44,13 +44,14 @@ from functools import wraps
 from typing import Dict, List, Optional, Tuple
 
 import ccxt
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, session
 
 # =====================================================================
 # 配置 — 沿用现有策略参数（含 v5.0 安全项）
 # =====================================================================
 PORT = 5055
 HOST = "127.0.0.1"              # ★ v5.0: 只监听本机，不再 0.0.0.0
+VERSION = "5.1.0"               # ★ 页面/API 展示的当前版本号
 
 # ★ 先加载 .env，再读配置（否则 .env 里的 BPX_LIVE=1 拿不到）
 env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -74,7 +75,9 @@ FUNDING_INTERVAL_DEFAULT_S = 3600  # ★ 资金费结算周期缺省值（Backpa
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arb_ledger.db")
 BPX_PUBLIC_KEY = os.environ.get("BPX_PUBLIC_KEY", "")
 BPX_SECRET_KEY = os.environ.get("BPX_SECRET_KEY", "")
-BPX_WEB_TOKEN = os.environ.get("BPX_WEB_TOKEN", "").strip()
+# ★ v5.1: 网页登录保护（用户名/密码），替代旧 BPX_WEB_TOKEN（token 注入页面=谁都能拿）
+BPX_WEB_USER = os.environ.get("BPX_WEB_USER", "").strip()
+BPX_WEB_PASSWORD = os.environ.get("BPX_WEB_PASSWORD", "").strip()
 # ★ 可选代理（如 CLI 直连被墙、浏览器走系统代理时）:
 #   在 .env 里配置 BPX_PROXY=http://127.0.0.1:10808 即可（ccxt 不读环境变量代理，必须显式设置）
 BPX_PROXY = os.environ.get("BPX_PROXY", "").strip()
@@ -89,6 +92,7 @@ logging.basicConfig(
 logger = logging.getLogger("arb")
 
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)   # ★ 会话 cookie 签名密钥（每次启动更换，旧会话失效）
 
 # =====================================================================
 # 初始化 ccxt + 启动硬校验
@@ -104,16 +108,20 @@ if BPX_PROXY:
     logger.info("已启用 HTTP 代理: %s", BPX_PROXY)
 logger.info("ccxt %s 已初始化 | %s", ccxt.__version__, "DRY-RUN" if DRY_RUN else "实盘")
 
-# ★ v5.0: 实盘启动硬校验（缺 key / 缺 WEB_TOKEN 直接拒绝启动，不再假跑 dry-run）
+# ★ 启动硬校验
+#   1. 实盘缺 API key → 拒绝启动（不再假跑 dry-run）
+#   2. 缺登录凭据 → 拒绝启动（公网可操作=裸奔）
 if not DRY_RUN and not has_key:
     logger.error("实盘模式(BPX_LIVE=1)必须配置 BPX_PUBLIC_KEY/BPX_SECRET_KEY，拒绝启动")
     sys.exit(1)
-if not DRY_RUN and not BPX_WEB_TOKEN:
-    logger.error("实盘模式(BPX_LIVE=1)必须配置 BPX_WEB_TOKEN（POST 接口认证），拒绝启动")
+if not DRY_RUN and not (BPX_WEB_USER and BPX_WEB_PASSWORD):
+    logger.error("实盘模式(BPX_LIVE=1)必须配置 BPX_WEB_USER/BPX_WEB_PASSWORD（网页登录保护），拒绝启动")
     sys.exit(1)
-if DRY_RUN and not BPX_WEB_TOKEN:
-    BPX_WEB_TOKEN = secrets.token_urlsafe(16)
-    logger.info("DRY-RUN 未配置 BPX_WEB_TOKEN，已自动生成随机 token 并注入页面")
+if DRY_RUN and not (BPX_WEB_USER and BPX_WEB_PASSWORD):
+    BPX_WEB_USER = "admin"
+    BPX_WEB_PASSWORD = secrets.token_urlsafe(12)
+    logger.info("DRY-RUN 未配置登录凭据，已自动生成 → 用户名: %s  密码: %s（重启后失效）",
+                BPX_WEB_USER, BPX_WEB_PASSWORD)
 
 # 预加载市场（精度/符号/过滤器）
 try:
@@ -1482,6 +1490,7 @@ def _build_state() -> dict:
         pass
 
     return {
+        "version": VERSION,
         "dry_run": DRY_RUN,
         "has_key": has_key,
         "positions": positions,
@@ -1498,21 +1507,61 @@ def _build_state() -> dict:
 
 
 # =====================================================================
-# Flask API（★ v5.0: 认证 + 任务模式 + 127.0.0.1）
+# Flask API（★ v5.1: 登录保护 + 任务模式 + 127.0.0.1）
 # =====================================================================
 
-def _check_auth() -> bool:
-    tok = request.headers.get("X-Auth-Token", "")
-    return bool(tok) and hmac.compare_digest(tok, BPX_WEB_TOKEN)
+_login_fails: Dict[str, list] = {}   # {ip: [fail_ts, ...]} 登录防爆破
 
 
-def require_auth(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not _check_auth():
-            return jsonify({"ok": False, "error": "未授权"}), 401
-        return fn(*args, **kwargs)
-    return wrapper
+def _is_authed() -> bool:
+    return bool(session.get("authed"))
+
+
+@app.before_request
+def _auth_guard():
+    """★ 全局登录保护：除登录页与登录接口外，全部要求已登录。
+    旧方案的 X-Auth-Token 注入页面=打开源码就能拿到，公网形同虚设；
+    v5.1 改为 Flask session + HttpOnly cookie，密码不经过前端源码。"""
+    if request.path in ("/login", "/api/login"):
+        return None
+    if _is_authed():
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "未登录"}), 401
+    return redirect("/login")
+
+
+@app.route("/login")
+def login_page():
+    if _is_authed():
+        return redirect("/")
+    return render_template("login.html", version=VERSION)
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    """登录：校验 BPX_WEB_USER/BPX_WEB_PASSWORD，成功写入 session"""
+    ip = request.remote_addr or "?"
+    fails = [t for t in _login_fails.get(ip, []) if time.time() - t < 60]
+    if len(fails) >= 5:
+        return jsonify({"ok": False, "error": "尝试次数过多，请 60 秒后再试"}), 429
+    data = request.get_json(silent=True) or {}
+    user = str(data.get("username", ""))
+    password = str(data.get("password", ""))
+    if (hmac.compare_digest(user, BPX_WEB_USER)
+            and hmac.compare_digest(password, BPX_WEB_PASSWORD)):
+        session["authed"] = True
+        session.permanent = False
+        add_log(f"网页登录成功: {user}")
+        return jsonify({"ok": True})
+    _login_fails.setdefault(ip, []).append(time.time())
+    return jsonify({"ok": False, "error": "用户名或密码错误"}), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
 
 
 def _safe_error(e: Exception) -> str:
@@ -1522,7 +1571,7 @@ def _safe_error(e: Exception) -> str:
 
 @app.route("/")
 def index():
-    return render_template("bpx_arb.html", web_token=BPX_WEB_TOKEN)
+    return render_template("bpx_arb.html", version=VERSION)
 
 
 @app.route("/api/symbols")
@@ -1605,7 +1654,6 @@ def _task_submit(task_id: str, symbol: str, fn):
 
 
 @app.route("/api/open", methods=["POST"])
-@require_auth
 def api_open():
     """开仓（任务模式：返回 task_id，结果由 /api/task 查询）"""
     data = request.get_json(silent=True) or {}
@@ -1636,7 +1684,6 @@ def api_open():
 
 
 @app.route("/api/close", methods=["POST"])
-@require_auth
 def api_close():
     """平仓（任务模式：返回 task_id）"""
     data = request.get_json(silent=True) or {}
@@ -1658,7 +1705,6 @@ def api_close():
 
 
 @app.route("/api/cancel", methods=["POST"])
-@require_auth
 def api_cancel():
     """撤单"""
     data = request.get_json(silent=True) or {}
@@ -1686,7 +1732,7 @@ def api_cancel():
 if __name__ == "__main__":
     _init_db()
     _reconcile_positions()
-    logger.info("======== 启动 Backpack 套利面板 v5.0 (ccxt) 端口 %d ========", PORT)
+    logger.info("======== 启动 Backpack 套利面板 v%s (ccxt) 端口 %d ========", VERSION, PORT)
     logger.info("模式: %s | 单笔: %dU | 超时: %ds | 净年化门槛: %.1f%% | 滑点上限: %dbps",
                 "DRY-RUN" if DRY_RUN else "实盘", ORDER_SIZE_USDC, PAIR_TIMEOUT_S,
                 MIN_NET_APY, MAX_SLIPPAGE_BPS)
