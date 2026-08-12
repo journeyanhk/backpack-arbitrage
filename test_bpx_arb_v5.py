@@ -130,6 +130,9 @@ class FakeExchange:
     def privateGetApiV1CapitalCollateral(self):
         return self.collateral
 
+    def privateGetApiV1BorrowLendPositions(self):
+        return []
+
     def publicGetApiV1Collateral(self):
         return []
 
@@ -278,6 +281,45 @@ class TestExecutePair(unittest.TestCase):
         self.assertLess(chase[0]["price"], 0.98)  # 穿过盘口
         # 追单数量为剩余未成交量（maker 未成交，全量追）
         self.assertAlmostEqual(chase[0]["amount"], 500.0)
+
+    def test_spot_chase_placement_fail_rolls_back_uncovered_only(self):
+        """★ 现货追单下单失败（如 BORROW_REQUIRES_LEND_REDEEM）→ 只回滚未对冲合约
+        （132 空头 - 125 现货 = 7），已成交部分保持中性，绝不整腿回滚留裸多"""
+        def create(symbol=None, type=None, side=None, amount=None, price=None, params=None):
+            self.ex._seq += 1
+            oid = f"oid-{self.ex._seq}"
+            rec = {"symbol": symbol, "side": side, "amount": amount, "price": price,
+                   "params": dict(params or {})}
+            if symbol == "MON/USDC" and side == "buy" and (params or {}).get("postOnly"):
+                # 现货 maker 部分成交 125/132
+                self.ex.order_state[oid] = {"status": "open", "filled": 125.0, "amount": amount}
+            elif ":USDC" in symbol and side == "sell" and (params or {}).get("postOnly"):
+                # 永续 maker 全部成交 132
+                self.ex.order_state[oid] = {"status": "closed", "filled": amount, "amount": amount}
+            elif symbol == "MON/USDC" and side == "buy" and not (params or {}).get("postOnly"):
+                self.ex.created.append(rec)
+                return None, None   # ★ 现货追单下单被交易所拒绝
+            elif ":USDC" in symbol and side == "buy":
+                # 回滚买单立即成交
+                self.ex.order_state[oid] = {"status": "closed", "filled": amount, "amount": amount}
+            else:
+                self.ex.order_state[oid] = {"status": "open", "filled": 0.0, "amount": amount}
+            self.ex.created.append(rec)
+            return {"id": oid, "status": self.ex.order_state[oid]["status"],
+                    "filled": self.ex.order_state[oid]["filled"], "amount": amount,
+                    "price": price, "average": None, "side": side, "symbol": symbol}
+
+        bpx.ex.create_order = create
+        ok, s_f, p_f, msg = bpx.execute_pair("MON", 132.0, timeout_s=30)
+        self.assertFalse(ok)
+        # 回滚永续买单只买了未对冲的 7 个（不是 132）
+        rollbacks = [c for c in self.ex.created if c["side"] == "buy" and ":USDC" in c["symbol"]]
+        self.assertEqual(len(rollbacks), 1)
+        self.assertAlmostEqual(rollbacks[0]["amount"], 7.0, places=6)
+        # 结果中性: 现货 125 + 永续空 125
+        pos = bpx._get_strategy_position("MON")
+        self.assertAlmostEqual(pos["spot_qty"], 125.0)
+        self.assertAlmostEqual(pos["perp_qty"], -125.0)
 
     def test_partial_chase_then_full(self):
         """永续追单先部分成交 200 再全成 → 增量记账正确，无漏记/重复"""

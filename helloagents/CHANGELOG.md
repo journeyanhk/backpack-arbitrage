@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+## [5.1.3] - 2026-08-12
+
+### 修复
+- ★ 永续追单下单失败时只回滚未对冲部分（132 空 - 125 现货 = 7），不再整腿回滚
+  留裸多（实测 XPL 留 125 裸多头）
+- ★ 开仓买入增加 autoLendRedeem：账户 USDC 被 autoLend 借出后，买入借币会报
+  BORROW_REQUIRES_LEND_REDEEM，现可先赎回再借/付
+- ★ 平仓数量修正：a) collateral.totalQuantity 对部分币种不含出借量（XPL 125 全借出
+  后只显示 1.0073），改取 collateral 汇总与 borrowLend positions 的最大兜底；
+  b) 纯现货平仓不再按 spot_qty×100/order_size 拆碎单（125 个被拆成 125 笔 1 个的卖单），
+  改为一次卖完
+
 ## [5.1.2] - 2026-08-12
 
 ### 修复

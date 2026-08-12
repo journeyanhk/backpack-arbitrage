@@ -51,7 +51,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session
 # =====================================================================
 PORT = 5055
 HOST = "127.0.0.1"              # ★ v5.0: 只监听本机，不再 0.0.0.0
-VERSION = "5.1.2"               # ★ 页面/API 展示的当前版本号
+VERSION = "5.1.3"               # ★ 页面/API 展示的当前版本号
 
 # ★ 先加载 .env，再读配置（否则 .env 里的 BPX_LIVE=1 拿不到）
 env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -460,17 +460,30 @@ def _funding_rate_info(ccxt_sym: str) -> Tuple[Optional[float], Optional[float]]
 
 
 def _get_spot_total(symbol: str) -> Optional[float]:
-    """账户该币种总持有量（含出借中，来自 collateral）"""
+    """★ 账户该币种实际总持有量（含出借中）。
+    collateral.totalQuantity 对部分币种（如 XPL）不包含出借量：125 买入全出借后
+    totalQuantity 只显示 1.0073。取 collateral 汇总与 borrowLend positions 的最大兜底。"""
     if not has_key or DRY_RUN:
         return None
+    total = 0.0
     try:
         col = _get_collateral_data(ex)
         for ci in col.get("collateral", []) or []:
             if ci.get("symbol") == symbol:
-                return float(ci.get("totalQuantity", 0) or 0)
+                total = max(total, float(ci.get("totalQuantity", 0) or 0))
+                total = max(total,
+                            float(ci.get("lendQuantity", 0) or 0)
+                            + float(ci.get("availableQuantity", 0) or 0)
+                            + float(ci.get("openOrderQuantity", 0) or 0))
     except Exception:
         pass
-    return None
+    try:
+        for p in (ex.privateGetApiV1BorrowLendPositions() or []):
+            if p.get("symbol") == symbol:
+                total = max(total, float(p.get("netQuantity", 0) or 0))
+    except Exception:
+        pass
+    return total if total > 0 else None
 
 
 def _get_usdc_borrow() -> Optional[float]:
@@ -511,6 +524,8 @@ def _order_params(market: str, intent: str, side: str, reduce_only: bool = False
         if intent == "open" and side == "buy":
             params["autoBorrow"] = True
             params["autoLend"] = True
+            params["autoLendRedeem"] = True   # ★ 可赎回已出借资产：账户 USDC 全被借出时，
+            #                                    买入借币会报 BORROW_REQUIRES_LEND_REDEEM
         elif intent == "close" and side == "sell":
             params["autoLend"] = True
             params["autoLendRedeem"] = True
@@ -925,8 +940,12 @@ def execute_pair(symbol: str, qty: float, timeout_s: int = PAIR_TIMEOUT_S) -> Tu
                     spot_oid, spot_coid = _place_limit(ex, spot_sym, "buy", remaining, px,
                                                        intent="open", post_only=False)
                     if not spot_oid:
-                        _rollback_open_leg(symbol, "perp", p_done)
-                        return False, s_done, p_done, "现货追单失败，已回滚合约"
+                        # ★ 只回滚未对冲部分（p_done - s_done），已成交的 s_done 保持中性，绝不整腿回滚留裸多
+                        uncovered = max(0.0, p_done - s_done)
+                        if uncovered > 1e-8:
+                            add_log(f"  ⚠ [{symbol}] 现货追单失败，回滚未对冲合约 {uncovered:.4f}")
+                            _rollback_open_leg(symbol, "perp", uncovered)
+                        return False, s_done, p_done, "现货追单失败，已回滚未对冲合约"
                     t0 = time.time()
                     while time.time() - t0 < HEDGE_TIMEOUT_S:
                         time.sleep(1)
@@ -1240,8 +1259,11 @@ def close_position(symbol: str, order_size: Optional[float] = None) -> dict:
     perp_price = perp_mark if perp_mark > 0 else 1.0
 
     perp_notional = perp_short * perp_price
-    pairs = max(1, int(perp_notional / _order_size)) if perp_short > 1e-8 \
-        else max(1, int(spot_qty * 100 / _order_size))
+    if perp_short > 1e-8:
+        pairs = max(1, int(perp_notional / _order_size))
+    else:
+        # ★ 纯现货平仓一次卖完（原公式 spot_qty×100/order_size 会把 125 个拆成 125 笔碎单）
+        pairs = 1
     pair_spot = spot_qty / pairs
     pair_perp = perp_short / pairs
 
