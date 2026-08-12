@@ -611,6 +611,38 @@ class TestOrderLookup(unittest.TestCase):
         bpx._unknown_exposure = False
 
 
+class TestNormalizePairQty(unittest.TestCase):
+    """★ 两侧精度不同（XRP 现货 0.1 / 永续 0.0001）时必须统一，否则产生恒定失衡"""
+
+    def setUp(self):
+        _reset_state()
+        self.ex = FakeExchange()
+        _install(self.ex)
+        bpx.markets = {
+            "MON/USDC": {"spot": True, "contractSize": 1.0, "precision": {"amount": 0.1},
+                         "limits": {"amount": {"min": 0.1}}},
+            "MON/USDC:USDC": {"swap": True, "contractSize": 1.0, "precision": {"amount": 0.0001},
+                              "limits": {"amount": {"min": 0.0001}}},
+        }
+
+    def test_unify_precision(self):
+        """9.7833 统一到较粗精度 0.1 → 9.7（两腿一致，不再 9.7 vs 9.7832）"""
+        q = bpx._normalize_pair_qty("MON", 9.7833)
+        self.assertAlmostEqual(q, 9.7, places=10)
+
+    def test_below_min(self):
+        """低于最小下单量 → None（拒绝开仓）"""
+        self.assertIsNone(bpx._normalize_pair_qty("MON", 0.05))
+
+    def test_open_uses_normalized_qty(self):
+        """开仓两腿数量一致（取整后的同一值）"""
+        self.ex.auto_fill = True
+        r = bpx.open_position("MON", 99.73, 1, order_size=100)
+        self.assertTrue(r["ok"])
+        amounts = {round(c["amount"], 6) for c in self.ex.created}
+        self.assertEqual(amounts, {99.7})
+
+
 class TestFundingInterval(unittest.TestCase):
     def setUp(self):
         _reset_state()

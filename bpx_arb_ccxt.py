@@ -51,7 +51,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session
 # =====================================================================
 PORT = 5055
 HOST = "127.0.0.1"              # ★ v5.0: 只监听本机，不再 0.0.0.0
-VERSION = "5.1.0"               # ★ 页面/API 展示的当前版本号
+VERSION = "5.1.1"               # ★ 页面/API 展示的当前版本号
 
 # ★ 先加载 .env，再读配置（否则 .env 里的 BPX_LIVE=1 拿不到）
 env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -1109,6 +1109,31 @@ def close_pair(symbol: str, spot_qty: float, perp_qty: float) -> Tuple[bool, flo
     return False, s_exec, p_exec
 
 
+def _normalize_pair_qty(symbol: str, qty: float) -> Optional[float]:
+    """★ 统一现货/永续两腿的数量精度（取较粗步长向下取整）。
+    两侧市场精度可能不同（如 XRP 现货 0.1 / 永续 0.0001）：不统一时现货被截断
+    （9.7833→9.7）而永续不截断（9.7832），造成恒定的 ~0.0832 失衡，触发虚假回滚。
+    返回 None 表示小于最小下单量。"""
+    import decimal
+    coarse = 1e-8
+    for s in (_ccxt_spot(symbol), _ccxt_perp(symbol)):
+        m = markets.get(s) or {}
+        p = float(m.get("precision", {}).get("amount", 1e-8) or 1e-8)
+        if p > 0:
+            coarse = max(coarse, p)
+    q = decimal.Decimal(str(qty))
+    step = decimal.Decimal(str(coarse))
+    norm = float(q - (q % step))   # 向下取整到步长整数倍
+    # 最小下单量校验（取两市场较大的 min）
+    mn = 0.0
+    for s in (_ccxt_spot(symbol), _ccxt_perp(symbol)):
+        m = markets.get(s) or {}
+        mn = max(mn, float(m.get("limits", {}).get("amount", {}).get("min", 0) or 0))
+    if norm <= 1e-12 or norm + 1e-12 < mn:
+        return None
+    return norm
+
+
 def open_position(symbol: str, notional: float, leverage: float,
                   order_size: Optional[float] = None, timeout: Optional[int] = None) -> dict:
     """开仓。★ leverage 参与目标名义计算：target_notional = notional × leverage"""
@@ -1168,7 +1193,11 @@ def open_position(symbol: str, notional: float, leverage: float,
 
     pairs = max(1, int(target_notional / _order_size))
     pair_notional = target_notional / pairs
-    pair_qty = pair_notional / mid   # ccxt 的 create_order 会自动量化
+    pair_qty = _normalize_pair_qty(symbol, pair_notional / mid)
+    if pair_qty is None:
+        return {"ok": False, "error": f"{symbol} 拆单后数量低于最小下单量（精度/步长限制），请加大单笔金额"}
+    add_log(f"开仓 {symbol}: 名义 {target_notional:.0f}U {pairs}笔 每笔{pair_notional:.0f}U/{pair_qty:.6f}个"
+            f"（已统一两侧精度）")
 
     ok_pairs = 0
     for i in range(pairs):
