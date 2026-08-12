@@ -33,6 +33,7 @@ import hmac
 import logging
 import math
 import os
+import random
 import secrets
 import sqlite3
 import sys
@@ -217,7 +218,13 @@ def _init_db():
 
 
 def _gen_client_order_id(symbol: str, intent: str) -> str:
-    return f"arb-{symbol}-{intent}-{int(time.time() * 1000)}"
+    """★ 生成 Backpack 兼容的 clientId（交易所要求 uint32 整数，字符串会被 400 拒绝）。
+    以十进制字符串存储于账本，碰撞时重试。"""
+    for _ in range(8):
+        cid = str(random.randint(1, 0xFFFFFFFF))
+        if not _get_order_row(cid):
+            return cid
+    return str(int(time.time() * 1000) % 0xFFFFFFFF)
 
 
 def _record_order(symbol: str, market: str, side: str, intent: str,
@@ -540,7 +547,7 @@ def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
 
     try:
         params = _order_params(market, intent, side, reduce_only)
-        params["clientId"] = coid
+        params["clientId"] = int(coid)   # ★ Backpack 要求 uint32 整数
         if post_only:
             params["postOnly"] = True
         order = exchange.create_order(
@@ -563,13 +570,17 @@ def _place_limit(exchange, ccxt_sym: str, side: str, amount: float,
         add_log(f"[FAIL] 余额不足 {action}: {str(e)[:120]}")
     except ccxt.NetworkError as e:
         # ★ 网络异常时订单可能已被接受：尝试找回，找回失败提示人工核查
-        add_log(f"[FAIL] 网络异常 {action}: {e}")
+        err_txt = str(e)
+        add_log(f"[FAIL] 网络异常 {action}: {err_txt}")
         rescued = _rescue_unknown_placement(ccxt_sym, coid)
         if rescued:
             _bind_order_id(coid, rescued)
             add_log(f"[恢复] 下单网络异常但已找回订单 {rescued}")
             return rescued, coid
-        add_log(f"[警告] 下单请求状态未知，可能已被交易所接受，请人工核查 {coid}")
+        if "400" in err_txt or "Bad Request" in err_txt or "parse request" in err_txt:
+            add_log(f"[FAIL] 下单被交易所拒绝（400），订单未接受，无需人工核查 {coid}")
+        else:
+            add_log(f"[警告] 下单请求状态未知，可能已被交易所接受，请人工核查 {coid}")
     except Exception as e:
         add_log(f"[FAIL] {action}: {type(e).__name__} {str(e)[:120]}")
     return None, coid
@@ -1150,8 +1161,9 @@ def close_position(symbol: str, order_size: Optional[float] = None) -> dict:
 
 
 def _reconcile_positions():
-    """★ 启动对账：真实持仓 vs 账本。
-    发现未知持仓/未知订单 → _unknown_exposure=True，禁止开新仓。"""
+    """★ 启动对账：真实持仓 vs 账本（真实持仓 ∪ 账本持仓 并集双向比对）。
+    发现未知持仓/未知订单 → _unknown_exposure=True，禁止开新仓。
+    特别注意：账本有而交易所没有的"幽灵持仓"也必须标记（否则平仓会卖空气）。"""
     global _unknown_exposure
     if not has_key or DRY_RUN:
         add_log("[对账] DRY-RUN/无 key，跳过")
@@ -1159,6 +1171,8 @@ def _reconcile_positions():
     perp_tradable = {s.split("/")[0] for s in perp_symbols}
     issues = 0
 
+    # 收集真实持仓: {sym: {"spot": qty, "perp": qty(signed)}}
+    real: Dict[str, dict] = {}
     try:
         ps = ex.fetch_positions() or []
         for p in ps:
@@ -1167,18 +1181,13 @@ def _reconcile_positions():
                 continue
             contracts = float(p.get("contracts", 0) or 0)
             cs = _contract_size(p["symbol"])
-            real_qty = contracts * cs
+            q = contracts * cs
             side = p.get("side")
-            if side == "short" and real_qty > 0:
-                real_qty = -real_qty
-            elif side == "long" and real_qty < 0:
-                real_qty = -real_qty
-            if abs(real_qty) <= 1e-8:
-                continue
-            lp = _get_strategy_position(base)
-            if abs(real_qty - lp["perp_qty"]) > 1e-6:
-                issues += 1
-                add_log(f"[对账] ⚠ {base} 合约: 真实 {real_qty:.6f} vs 账本 {lp['perp_qty']:.6f} → 未知敞口")
+            if side == "short" and q > 0:
+                q = -q
+            elif side == "long" and q < 0:
+                q = -q
+            real.setdefault(base, {"spot": 0.0, "perp": 0.0})["perp"] = q
     except Exception as e:
         issues += 1
         add_log(f"[对账] 无法读取合约持仓: {e}")
@@ -1189,20 +1198,30 @@ def _reconcile_positions():
             sym = ci.get("symbol", "")
             if sym not in perp_tradable:
                 continue
-            real_qty = float(ci.get("totalQuantity", 0) or 0)
-            if abs(real_qty) <= 1e-8:
-                continue
-            lp = _get_strategy_position(sym)
-            if abs(real_qty - lp["spot_qty"]) > 1e-6:
-                issues += 1
-                add_log(f"[对账] ⚠ {sym} 现货: 真实 {real_qty:.6f} vs 账本 {lp['spot_qty']:.6f} → 未知敞口")
+            real.setdefault(sym, {"spot": 0.0, "perp": 0.0})["spot"] = float(ci.get("totalQuantity", 0) or 0)
     except Exception as e:
         issues += 1
         add_log(f"[对账] 无法读取现货持仓: {e}")
 
+    # 账本持仓
+    ledger = {r["symbol"]: {"spot": r["spot_qty"], "perp": r["perp_qty"]}
+              for r in _all_strategy_positions()}
+
+    # ★ 并集双向比对
+    for sym in set(real) | set(ledger):
+        rq = real.get(sym, {"spot": 0.0, "perp": 0.0})
+        lq = ledger.get(sym, {"spot": 0.0, "perp": 0.0})
+        if abs(rq["spot"] - lq["spot"]) > 1e-6:
+            issues += 1
+            add_log(f"[对账] ⚠ {sym} 现货: 真实 {rq['spot']:.6f} vs 账本 {lq['spot']:.6f} → 未知敞口")
+        if abs(rq["perp"] - lq["perp"]) > 1e-6:
+            issues += 1
+            add_log(f"[对账] ⚠ {sym} 合约: 真实 {rq['perp']:.6f} vs 账本 {lq['perp']:.6f} → 未知敞口")
+
     if issues:
         _unknown_exposure = True
-        add_log(f"[对账] 发现 {issues} 处未知敞口，已禁止开仓（可用 /api/close 平掉账本持仓后人工核对）")
+        add_log(f"[对账] 发现 {issues} 处未知敞口，已禁止开仓（请人工核对：交易所真实持仓 vs 账本，"
+                f"必要时清理 arb_ledger.db 中对应的幽灵持仓）")
     else:
         add_log("[对账] 账本与真实持仓一致 ✓")
 

@@ -541,6 +541,32 @@ class TestOrderLookup(unittest.TestCase):
         # 模拟 dry 订单状态检查: 应返回已确认的请求量而非 0
         self.assertEqual(bpx._check_order_filled(bpx.ex, "MON/USDC", "dry-123-1")[1], 500.0)
 
+    def test_client_id_is_uint32_integer(self):
+        """★ Backpack 要求 clientId 为 uint32 整数，字符串会被 400 拒绝"""
+        self.ex = FakeExchange()
+        _install(self.ex)
+        self.ex.auto_fill = True
+        bpx.open_position("MON", 100, 1, order_size=100)
+        for c in self.ex.created:
+            cid = c["params"].get("clientId")
+            self.assertIsInstance(cid, int, f"clientId 必须是整数，实际 {cid!r}")
+            self.assertTrue(1 <= cid <= 0xFFFFFFFF)
+
+    def test_reconcile_detects_phantom_ledger(self):
+        """★ 对账并集检查：账本有持仓而交易所没有（幽灵持仓）也必须标记未知敞口"""
+        self.ex = FakeExchange()
+        _install(self.ex)
+        self.ex.positions = []  # 交易所无任何持仓
+        self.ex.collateral = {"collateral": [], "netEquityAvailable": 100000.0,
+                              "assetsValue": 0, "marginFraction": 0}
+        # 账本播种幽灵持仓（模拟 DRY-RUN 残留）
+        coid = bpx._record_order("MON", "spot", "buy", "open", 39.0, 1.0)
+        bpx._update_order_fill("MON", "spot", "buy", "oid-x", coid, 39.0, "closed")
+        bpx._unknown_exposure = False
+        bpx._reconcile_positions()
+        self.assertTrue(bpx._unknown_exposure, "幽灵持仓必须被对账发现")
+        bpx._unknown_exposure = False
+
 
 class TestFundingInterval(unittest.TestCase):
     def setUp(self):
