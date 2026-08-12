@@ -51,7 +51,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session
 # =====================================================================
 PORT = 5055
 HOST = "127.0.0.1"              # ★ v5.0: 只监听本机，不再 0.0.0.0
-VERSION = "5.1.1"               # ★ 页面/API 展示的当前版本号
+VERSION = "5.1.2"               # ★ 页面/API 展示的当前版本号
 
 # ★ 先加载 .env，再读配置（否则 .env 里的 BPX_LIVE=1 拿不到）
 env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -1278,10 +1278,39 @@ def close_position(symbol: str, order_size: Optional[float] = None) -> dict:
             "debt": debt_msg}
 
 
+def _adjust_ledger(symbol: str, leg: str, qty: float):
+    """对账时把账本某腿直接校正为给定值（仅用于微小尘差自动对齐）"""
+    conn = _db_conn()
+    try:
+        pos = conn.execute("SELECT spot_qty, perp_qty FROM strategy_positions WHERE symbol=?",
+                           (symbol,)).fetchone()
+        s = float(pos["spot_qty"]) if pos else 0.0
+        p = float(pos["perp_qty"]) if pos else 0.0
+        if leg == "spot":
+            s = qty
+        else:
+            p = qty
+        conn.execute(
+            "INSERT INTO strategy_positions (symbol, spot_qty, perp_qty, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(symbol) DO UPDATE SET spot_qty=excluded.spot_qty, "
+            "perp_qty=excluded.perp_qty, updated_at=excluded.updated_at",
+            (symbol, s, p, datetime.now().isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _market_step(symbol: str, leg: str) -> float:
+    """市场最小数量步长（容差基准）。spot 用现货市场精度，perp 用永续市场精度。"""
+    s = _ccxt_spot(symbol) if leg == "spot" else _ccxt_perp(symbol)
+    m = markets.get(s) or {}
+    return float(m.get("precision", {}).get("amount", 1e-8) or 1e-8)
+
+
 def _reconcile_positions():
     """★ 启动对账：真实持仓 vs 账本（真实持仓 ∪ 账本持仓 并集双向比对）。
-    发现未知持仓/未知订单 → _unknown_exposure=True，禁止开新仓。
-    特别注意：账本有而交易所没有的"幽灵持仓"也必须标记（否则平仓会卖空气）。"""
+    - 差异 ≤ 市场最小步长（手续费扣币/精度截断产生的尘差）→ 自动对齐账本，不影响交易
+    - 差异 > 步长（真实未知敞口/幽灵持仓）→ _unknown_exposure=True，禁止开新仓"""
     global _unknown_exposure
     if not has_key or DRY_RUN:
         add_log("[对账] DRY-RUN/无 key，跳过")
@@ -1325,16 +1354,20 @@ def _reconcile_positions():
     ledger = {r["symbol"]: {"spot": r["spot_qty"], "perp": r["perp_qty"]}
               for r in _all_strategy_positions()}
 
-    # ★ 并集双向比对
+    # ★ 并集双向比对（含微差自动对齐）
     for sym in set(real) | set(ledger):
         rq = real.get(sym, {"spot": 0.0, "perp": 0.0})
         lq = ledger.get(sym, {"spot": 0.0, "perp": 0.0})
-        if abs(rq["spot"] - lq["spot"]) > 1e-6:
+        for leg, key in (("现货", "spot"), ("合约", "perp")):
+            r, l = rq[key], lq[key]
+            tol = max(1e-6, _market_step(sym, key))
+            if abs(r - l) <= tol:
+                if abs(r - l) > 1e-10:
+                    _adjust_ledger(sym, key, r)
+                    add_log(f"[对账] {sym} {leg}: 账本 {l:.6f} → 真实 {r:.6f}（手续费/截断尘差，已自动对齐）")
+                continue
             issues += 1
-            add_log(f"[对账] ⚠ {sym} 现货: 真实 {rq['spot']:.6f} vs 账本 {lq['spot']:.6f} → 未知敞口")
-        if abs(rq["perp"] - lq["perp"]) > 1e-6:
-            issues += 1
-            add_log(f"[对账] ⚠ {sym} 合约: 真实 {rq['perp']:.6f} vs 账本 {lq['perp']:.6f} → 未知敞口")
+            add_log(f"[对账] ⚠ {sym} {leg}: 真实 {r:.6f} vs 账本 {l:.6f} → 未知敞口")
 
     if issues:
         _unknown_exposure = True

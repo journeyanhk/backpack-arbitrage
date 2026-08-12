@@ -610,6 +610,35 @@ class TestOrderLookup(unittest.TestCase):
         self.assertTrue(bpx._unknown_exposure, "幽灵持仓必须被对账发现")
         bpx._unknown_exposure = False
 
+    def test_reconcile_auto_aligns_fee_dust(self):
+        """★ 手续费扣币尘差（如 XRP 买 9.7 被扣 0.0097 手续费）≤ 市场步长 → 自动对齐不拦开仓"""
+        self.ex = FakeExchange()
+        _install(self.ex)
+        bpx.markets = {
+            "MON/USDC": {"spot": True, "contractSize": 1.0, "precision": {"amount": 0.1},
+                         "limits": {"amount": {"min": 0.1}}},
+            "MON/USDC:USDC": {"swap": True, "contractSize": 1.0, "precision": {"amount": 0.0001},
+                              "limits": {"amount": {"min": 0.0001}}},
+        }
+        # 真实: 现货 9.6903（买 9.7 被扣 0.0097 手续费）；账本: 9.7
+        self.ex.positions = [{"symbol": "MON/USDC:USDC", "contracts": -9.7, "side": "short",
+                              "markPrice": 1.0, "entryPrice": 1.0, "notional": 9.7,
+                              "unrealizedPnl": 0}]
+        self.ex.collateral = {"collateral": [{"symbol": "MON", "totalQuantity": 9.6903,
+                                              "availableQuantity": 0, "lendQuantity": 9.6903}],
+                              "netEquityAvailable": 100000.0, "assetsValue": 0,
+                              "marginFraction": 0}
+        coid = bpx._record_order("MON", "spot", "buy", "open", 9.7, 1.0)
+        bpx._update_order_fill("MON", "spot", "buy", "oid-x", coid, 9.7, "closed")
+        coid2 = bpx._record_order("MON", "perp", "sell", "open", 9.7, 1.0)
+        bpx._update_order_fill("MON", "perp", "sell", "oid-y", coid2, 9.7, "closed")
+        bpx._unknown_exposure = False
+        bpx._reconcile_positions()
+        self.assertFalse(bpx._unknown_exposure, "尘差应自动对齐而非禁止开仓")
+        pos = bpx._get_strategy_position("MON")
+        self.assertAlmostEqual(pos["spot_qty"], 9.6903, places=6)  # 已对齐真实值
+        self.assertAlmostEqual(pos["perp_qty"], -9.7)
+
 
 class TestNormalizePairQty(unittest.TestCase):
     """★ 两侧精度不同（XRP 现货 0.1 / 永续 0.0001）时必须统一，否则产生恒定失衡"""
